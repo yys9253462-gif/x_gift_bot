@@ -163,7 +163,7 @@ export function Shell({
         }}
       >
         <Typography variant="body2" component="span">
-          © 2026 mizorewww
+          © 2026 Teyir
         </Typography>
         <Typography variant="body2" component="span" aria-hidden="true">
           ·
@@ -172,7 +172,7 @@ export function Shell({
           variant="body2"
           color="inherit"
           underline="hover"
-          href="https://github.com/mizorewww/x_gift_bot/blob/main/LICENSE"
+          href="https://github.com/yys9253462-gif/x_gift_bot/blob/main/LICENSE"
           target="_blank"
           rel="noopener noreferrer"
         >
@@ -185,7 +185,7 @@ export function Shell({
           variant="body2"
           color="inherit"
           underline="hover"
-          href="https://github.com/mizorewww/x_gift_bot"
+          href="https://github.com/yys9253462-gif/x_gift_bot"
           target="_blank"
           rel="noopener noreferrer"
           sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}

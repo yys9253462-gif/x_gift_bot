@@ -7,8 +7,6 @@ X（Twitter）Premium 礼品兑换平台。你生成兑换码发给用户，用�
 - **安全**：凭据逐条 AES-256-GCM 加密存储，付款前逐项校验金额与商户，付款确认只提交一次
 - **抗上游失效**：X 的 GraphQL 标识可在线热更新，不需要重新编译
 
-> 本项目 fork 自 [mizorewww/x_gift_bot](https://github.com/mizorewww/x_gift_bot)，上游历史完整保留。
-
 ## 截图
 
 以下截图来自本地模拟预览（全部为示例数据）：
@@ -270,4 +268,4 @@ go test ./...        # 全量测试
 
 ## 许可
 
-MIT，详见 [LICENSE](LICENSE)。上游项目：[mizorewww/x_gift_bot](https://github.com/mizorewww/x_gift_bot)。
+MIT，详见 [LICENSE](LICENSE)。
