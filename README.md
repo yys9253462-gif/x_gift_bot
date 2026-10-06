@@ -47,14 +47,6 @@ X 会不定期更换 GraphQL 的查询标识（`queryId`），届时所有请求
 | 配置 | 查询出口 | 账号资格查询的出口 |
 | 运维 | 运维 | 付款节点状态、手动补单、统计概览 |
 
-| 兑换页 | 管理页 |
-|---|---|
-| ![兑换页](docs/screenshots/redeem-light.png) | ![管理页 · 浅色](docs/screenshots/admin-light.png) |
-
-管理页深色模式：
-
-![管理页 · 深色](docs/screenshots/admin-dark.png)
-
 **界面细节**：统一的面板组件（语义化 `section` + 标题层级）、超宽屏自适应居中、深色模式对比度符合 WCAG AA、窄屏侧栏自动收起。
 
 ## 本地预览（不写任何真实配置）
@@ -281,7 +273,7 @@ tools/
   priceprobe/       只读：向 X 询价，核对实际币种与金额
   readfail/         只读：查看 vault 记录与失败审计
 deploy/             systemd 单元、Caddyfile、site.env 示例
-docs/               付款节点池说明与截图
+docs/               付款节点池说明
 ```
 
 其他命令：
