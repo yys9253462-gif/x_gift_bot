@@ -103,7 +103,8 @@ export function Shell({
   children,
 }: {
   admin?: boolean;
-  maxWidth?: "xs" | "sm" | "md" | "lg";
+  /** 内容最大宽度（像素）。省略时前台 600、后台 1600，均居中。 */
+  maxWidth?: number;
   children: ReactNode;
 }) {
   return (
@@ -128,13 +129,20 @@ export function Shell({
       >
         跳转到主要内容
       </Link>
-      <Container
+      <Box
         id="main"
         component="main"
         tabIndex={-1}
-        maxWidth={maxWidth ?? (admin ? "lg" : "sm")}
+        // 这里不用 MUI 的 Container：它的 maxWidth 断点会与自定义宽度打架
+        // （maxWidth={false} 输出的 max-width:none 会压过 sx 里的上限）。
+        // 直接用 Box + maxWidth + margin auto，行为可预测。
         sx={{
-          py: { xs: 3, sm: 6 },
+          width: "100%",
+          maxWidth: maxWidth ?? (admin ? 1600 : 600),
+          mx: "auto",
+          px: { xs: 2, sm: 3 },
+          py: { xs: 3, sm: admin ? 4 : 6 },
+          minHeight: 0,
           "&:focus-visible": { outline: "none" },
         }}
       >
@@ -186,7 +194,7 @@ export function Shell({
           GitHub
         </Link>
       </Box>
-      </Container>
+      </Box>
     </>
   );
 }

@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,6 +48,10 @@ type server struct {
 	vault            *vault.Vault
 	origin           string
 	adminHash        [32]byte
+	adminPath        string
+	setupHash        [32]byte
+	bootstrap        atomic.Bool
+	stateMu          sync.RWMutex
 	payments         bool
 	port             int
 	lockPath         string
@@ -104,20 +109,46 @@ func Run(ctx context.Context) error {
 	if err = syscall.Flock(int(instance.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return errors.New("another site instance is using this data directory")
 	}
-	admin, err := privateFile(os.Getenv("XGIFT_ADMIN_PASSWORD_FILE"))
-	if err != nil {
-		return err
-	}
+	// A missing or too-short admin password file is what marks the site as
+	// uninitialised. In that mode the server still boots, but every route is
+	// closed except /setup, which is how an operator configures a fresh deploy
+	// without a working CLI over SSH.
+	adminPath := os.Getenv("XGIFT_ADMIN_PASSWORD_FILE")
+	admin, adminErr := privateFile(adminPath)
 	admin = []byte(strings.TrimSpace(string(admin)))
-	if len(admin) < 32 {
-		return errors.New("admin password must contain at least 32 characters")
+	bootstrap := adminErr != nil || len(admin) < 32
+	var adminHash, setupHash [32]byte
+	if bootstrap {
+		clear(admin)
+		setup, e := privateFile(os.Getenv("XGIFT_SETUP_PASSWORD_FILE"))
+		if e != nil {
+			return errors.New("site is not initialised: XGIFT_SETUP_PASSWORD_FILE must name a readable owner-only file")
+		}
+		setup = []byte(strings.TrimSpace(string(setup)))
+		if len(setup) < setupMinLength {
+			return errors.New("setup password must contain at least 12 characters")
+		}
+		setupHash = sha256.Sum256(setup)
+		clear(setup)
+	} else {
+		adminHash = sha256.Sum256(admin)
+		clear(admin)
 	}
-	s := &server{origin: origin, adminHash: sha256.Sum256(admin), payments: os.Getenv("XGIFT_PAYMENTS_ENABLED") == "true", lockPath: filepath.Join(dir, "checkout.lock"), work: make(chan struct{}, 1), checks: make(chan struct{}, 4), ctx: ctx, limits: map[string]limit{}}
-	clear(admin)
+	s := &server{origin: origin, adminHash: adminHash, adminPath: adminPath, payments: os.Getenv("XGIFT_PAYMENTS_ENABLED") == "true", lockPath: filepath.Join(dir, "checkout.lock"), work: make(chan struct{}, 1), checks: make(chan struct{}, 4), ctx: ctx, limits: map[string]limit{}}
+	s.setupHash = setupHash
+	s.bootstrap.Store(bootstrap)
 	if err = s.configureTurnstile(); err != nil {
 		return err
 	}
-	v, err := vault.Open(filepath.Join(dir, "vault.db"), os.Getenv("XGIFT_PASSWORD_FILE"), false)
+	// A missing vault means a fresh deploy, which only bootstrap may create. If
+	// the vault is gone but the admin password still exists, the data directory
+	// was removed underneath a configured site and must not be silently recreated.
+	vaultPath := filepath.Join(dir, "vault.db")
+	_, vaultStatErr := os.Lstat(vaultPath)
+	if vaultStatErr != nil && !bootstrap {
+		return errors.New("vault database is missing while the admin password still exists; remove that file to run setup again")
+	}
+	v, err := vault.Open(vaultPath, os.Getenv("XGIFT_PASSWORD_FILE"), vaultStatErr != nil)
 	if err != nil {
 		return err
 	}
@@ -127,7 +158,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	defer v.Close()
-	if s.payments {
+	if s.payments && !bootstrap {
 		if err = checkout.CheckPaymentConfiguration(v); err != nil {
 			return err
 		}
@@ -198,7 +229,12 @@ func Run(ctx context.Context) error {
 	}
 	raw, err := v.Get("proxy")
 	if err != nil {
-		return err
+		if !bootstrap {
+			return err
+		}
+		// Bootstrap has no stored proxy yet, but the embedded sing-box still
+		// has to start so the form can be served. A direct outbound is enough.
+		raw = []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -254,6 +290,25 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/admin/folders/delete", s.admin(s.deleteFolder))
 	mux.HandleFunc("POST /api/admin/codes/move", s.admin(s.moveCodes))
 	mux.HandleFunc("POST /api/admin/codes/copy", s.admin(s.copyCode))
+	// Credentials stay editable from the admin panel after setup; only the
+	// first-run page below is conditional.
+	mux.HandleFunc("GET /api/admin/settings", s.admin(s.adminSettings))
+	mux.HandleFunc("POST /api/admin/settings/credentials", s.admin(s.saveCredentials))
+	mux.HandleFunc("POST /api/admin/settings/cards", s.admin(s.addCards))
+	mux.HandleFunc("POST /api/admin/settings/cards/remove", s.admin(s.removeCard))
+	mux.HandleFunc("POST /api/admin/settings/cards/unblock", s.admin(s.unblockCards))
+	mux.HandleFunc("POST /api/admin/settings/stripe", s.admin(s.saveStripe))
+	mux.HandleFunc("POST /api/admin/settings/catalog", s.admin(s.saveCatalog))
+	mux.HandleFunc("POST /api/admin/settings/proxy", s.admin(s.saveProxy))
+	mux.HandleFunc("GET /api/admin/settings/outbounds", s.admin(s.outboundsStatus))
+	mux.HandleFunc("POST /api/admin/settings/outbounds", s.admin(s.saveOutbounds))
+	if bootstrap {
+		mux.HandleFunc("GET /setup", s.setupPage)
+		mux.HandleFunc("GET /setup.js", s.asset("setup.js", "application/javascript; charset=utf-8"))
+		mux.HandleFunc("GET /api/setup/status", s.setupStatus)
+		mux.HandleFunc("POST /api/setup/apply", s.setupApply)
+		mux.HandleFunc("POST /api/setup/restart", s.setupRestart)
+	}
 	addr := os.Getenv("XGIFT_LISTEN")
 	if addr == "" {
 		addr = "127.0.0.1:8787"
@@ -262,7 +317,7 @@ func Run(ctx context.Context) error {
 	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
 		return errors.New("listen address must use a loopback IP")
 	}
-	h := &http.Server{Addr: addr, Handler: s.middleware(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	h := &http.Server{Addr: addr, Handler: s.middleware(s.bootstrapGate(mux)), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 50 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() { done <- h.ListenAndServe() }()
 	log.Printf("xgift-web listening on %s; payments enabled=%t", addr, s.payments)
@@ -446,6 +501,10 @@ func (s *server) middleware(next http.Handler) http.Handler {
 }
 func (s *server) admin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.bootstrapEnabled() {
+			message(w, 503, "站点尚未初始化，请先访问 /setup 完成配置。")
+			return
+		}
 		user, password, ok := r.BasicAuth()
 		sum := sha256.Sum256([]byte(password))
 		if !ok || subtle.ConstantTimeCompare(sum[:], s.adminHash[:]) != 1 || user != "admin" {
@@ -455,6 +514,28 @@ func (s *server) admin(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// bootstrapEnabled reports whether the site still has to be configured. It is
+// read on every request, so it stays in an atomic rather than a plain field.
+func (s *server) bootstrapEnabled() bool { return s.bootstrap.Load() }
+
+// bootstrapGate closes the whole site while it is uninitialised. Only the
+// bootstrap page, its assets and the health probe stay reachable, so a fresh
+// deploy cannot be probed for redemption codes before it exists.
+func (s *server) bootstrapGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.bootstrapEnabled() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		switch r.URL.Path {
+		case "/setup", "/setup.js", "/api/setup/status", "/api/setup/apply", "/api/setup/restart", "/favicon.svg", "/healthz":
+			next.ServeHTTP(w, r)
+		default:
+			message(w, 503, "站点尚未初始化，请先访问 /setup 完成配置。")
+		}
+	})
 }
 func (s *server) find(code string) (codeRow, error) {
 	var c codeRow
@@ -672,7 +753,12 @@ func (s *server) redeem(w http.ResponseWriter, r *http.Request) {
 				msg = "订单已创建，尚未提交付款。可以重新检查并继续兑换。"
 			}
 		}
-		if errors.Is(err, checkout.ErrXReadFailure) {
+		if errors.Is(err, checkout.ErrGiftNotAuthorised) {
+			// 这是账号层面的拒绝，不是接收方的问题，也不是标识失效。
+			// 说清楚该改哪里，别让管理员去翻 X 的原始响应。
+			msg = "发送方 X 账号不具备赠送资格，X 拒绝了本次下单，尚未提交付款。" +
+				"常见原因：发送方未验证手机号、账号过新或被限制。请更换凭据后重试。"
+		} else if errors.Is(err, checkout.ErrXReadFailure) {
 			msg = "暂时无法向 X 核实账号或套餐，本次未提交付款。请稍后点击「重新检查并继续兑换」。"
 		} else if errors.Is(err, checkout.ErrNotEligible) {
 			msg = "X 当前不允许该账号接收 Premium 赠送，本次未提交付款。账号符合条件后，可重新检查并继续兑换。"

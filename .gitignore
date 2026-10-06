@@ -17,3 +17,12 @@ __pycache__/
 .cloudflare/
 node_modules/
 .artifacts/
+
+# 运行期机密：这些文件一旦生成在仓库目录里就会显示为 untracked，
+# 极易被 `git add -A` 顺手提交。列在这里比事后清理便宜得多。
+vault-password
+password-path
+admin-password
+setup-password
+**/site.env
+!**/site.env.example

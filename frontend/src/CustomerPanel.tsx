@@ -7,7 +7,6 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
-  Paper,
   Stack,
   TextField,
   Typography,
@@ -15,6 +14,7 @@ import {
 import { adminApi } from "./adminApi";
 import { codeStatus } from "./codeStatus";
 import PersonSearchRounded from "@mui/icons-material/PersonSearchRounded";
+import { Panel } from "./Panel";
 
 type Detail = {
   order: {
@@ -96,22 +96,13 @@ export function CustomerPanel({
   }
   return (
     <>
-      <Paper
-        variant="outlined"
-        component="section"
-        aria-labelledby="customer-panel-title"
-        sx={{ p: { xs: 2, sm: 3 }, height: "100%" }}
+      <Panel
+        id="customer"
+        icon={<PersonSearchRounded fontSize="small" />}
+        title="按客户查询"
+        hint="直接查看客户对应的完整兑换码和付款链接，无需按批次翻页。"
+        sx={{ height: "100%" }}
       >
-        <Stack direction="row" spacing={1} alignItems="center">
-          <PersonSearchRounded color="primary" aria-hidden="true" />
-          <Typography
-            id="customer-panel-title"
-            variant="h2"
-            sx={{ fontSize: 21 }}
-          >
-            按客户查询
-          </Typography>
-        </Stack>
         <Box
           component="form"
           onSubmit={(e) => {
@@ -141,10 +132,7 @@ export function CustomerPanel({
             </Button>
           </Stack>
         </Box>
-        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-          直接查看客户对应的完整兑换码和付款链接，无需按批次翻页。
-        </Typography>
-      </Paper>
+      </Panel>
       <Dialog
         open={open}
         onClose={close}

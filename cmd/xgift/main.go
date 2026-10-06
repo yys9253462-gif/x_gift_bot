@@ -35,26 +35,40 @@ func run() error {
 	args := os.Args[1:]
 	command := ""
 	sub := ""
-	rest := []string{}
+	flags := []string{}
+	positional := []string{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
-			rest = append(rest, a)
+			flags = append(flags, a)
 			if a == "--db" || a == "--password-file" || a == "--profile" || a == "--port" || a == "--name" || a == "--months" || a == "--last4" {
 				i++
 				if i >= len(args) {
 					return errors.New("missing flag value")
 				}
-				rest = append(rest, args[i])
+				flags = append(flags, args[i])
 			}
-		} else if command == "" {
-			command = a
-		} else if command == "cards" && sub == "" {
-			sub = a
 		} else {
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) > 0 {
+		command = positional[0]
+		switch extra := positional[1:]; {
+		case len(extra) == 0:
+		case command == "cards" && len(extra) == 1:
+			sub = extra[0]
+		case command == "ops":
+			// ops forwards its own subcommand words to runOps verbatim.
+		default:
 			return errors.New("unexpected argument")
 		}
 	}
+	// Flags must be handed to the flag package ahead of the positional words:
+	// it stops parsing at the first non-flag token, so `xgift ops show --db X`
+	// would otherwise drop every flag written after the subcommand — silently
+	// opening the wrong vault.
+	rest := append(flags, positional...)
 	f := flag.NewFlagSet("xgift", flag.ContinueOnError)
 	defaultDB := "sqlite/vault.db"
 	if exe, e := os.Executable(); e == nil {
@@ -76,7 +90,7 @@ func run() error {
 	pay := f.Bool("pay", false, "pay only at the exact catalog plan total")
 	name := f.String("name", "", "secret name for put")
 	f.Usage = func() {
-		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|billing|cards|import-chrome|put|proxy|check|check-payment-outbounds|resume-payments|username> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put reads one JSON value from stdin (stripe-key: the raw pk_live_ key; catalog: merchant/plan catalog JSON; payment-outbounds: an outbound array; cards: a card array). cards list|add|remove|unblock|rotate manages the encrypted payment card pool. check-payment-outbounds probes public endpoints without paying.")
+		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|billing|cards|import-chrome|put|proxy|check|check-payment-outbounds|ops|resume-payments|username> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put reads one JSON value from stdin (stripe-key: the raw pk_live_ key; catalog: merchant/plan catalog JSON; payment-outbounds: an outbound array; cards: a card array). cards list|add|remove|unblock|rotate manages the encrypted payment card pool. check-payment-outbounds probes public endpoints without paying. ops show|set|reset|probe manages the X GraphQL identifiers without a rebuild.")
 		f.PrintDefaults()
 	}
 	if err := f.Parse(rest); err != nil {
@@ -150,6 +164,13 @@ func run() error {
 	}
 	defer v.Close()
 	switch command {
+	case "ops":
+		// "probe" needs the proxy, so it is handled further down once the
+		// embedded proxy is listening; everything else is local vault I/O.
+		if len(f.Args()) > 1 && f.Args()[1] == "probe" {
+			break
+		}
+		return runOps(v, f.Args()[1:])
 	case "cards":
 		return runCards(v, sub, *last4)
 	case "check-payment-outbounds":
@@ -321,7 +342,7 @@ func run() error {
 			return errors.New("--name must be proxy, payment-outbounds, card, cards, cookies, api-auth, stripe-key or catalog")
 		}
 	}
-	if command != "proxy" && command != "check" && !regexp.MustCompile(`^@?[A-Za-z0-9_]{1,15}$`).MatchString(command) {
+	if command != "proxy" && command != "check" && command != "ops" && !regexp.MustCompile(`^@?[A-Za-z0-9_]{1,15}$`).MatchString(command) {
 		return errors.New("invalid command or X username")
 	}
 	if command != "proxy" && command != "check" {
@@ -368,6 +389,22 @@ func run() error {
 	if command == "check" {
 		return proxy.Check(ctx, *port)
 	}
+	if command == "ops" {
+		report, e := checkout.ProbeIdentifier(ctx, v, *port)
+		if e != nil {
+			return e
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			return err
+		}
+		if report.GraphQLError {
+			return errors.New("X returned a GraphQL error envelope; see the explanation above before changing any identifier")
+		}
+		if report.Inconclusive {
+			return errors.New("the probe could not reach a verdict; check the proxy and cookies rather than the identifiers")
+		}
+		return nil
+	}
 	if *inspect {
 		return checkout.Inspect(ctx, v, command, *port, *months)
 	}
@@ -385,6 +422,77 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "Checkout status:", result.Status)
 	}
 	return e
+}
+
+func runOps(v *vault.Vault, args []string) error {
+	switch {
+	case len(args) == 0:
+		return opsShow(v)
+	case args[0] == "show":
+		if len(args) != 1 {
+			return errors.New("usage: xgift ops show")
+		}
+		return opsShow(v)
+	case args[0] == "set":
+		if len(args) != 3 {
+			return errors.New("usage: xgift ops set <" + checkout.OpPremiumGifting + "|" + checkout.OpProductDetails + "|" + checkout.OpOneTimeGiftMutation + "> <queryId>")
+		}
+		ops, err := checkout.LoadOps(v)
+		if err != nil {
+			return err
+		}
+		switch args[1] {
+		case checkout.OpPremiumGifting:
+			ops.PremiumGifting = args[2]
+		case checkout.OpProductDetails:
+			ops.ProductDetails = args[2]
+		case checkout.OpOneTimeGiftMutation:
+			ops.OneTimeGiftMutation = args[2]
+		default:
+			return errors.New("unknown operation name")
+		}
+		if err = checkout.SaveOps(v, ops); err != nil {
+			return err
+		}
+		fmt.Printf("已更新 %s；下一笔订单即生效，无需重新编译\n", args[1])
+		return nil
+	case args[0] == "reset":
+		if len(args) != 1 {
+			return errors.New("usage: xgift ops reset")
+		}
+		if err := checkout.SaveOps(v, checkout.Ops{}); err != nil {
+			return err
+		}
+		fmt.Println("已删除覆盖值，回到编译进程序的默认值")
+		return nil
+	case args[0] == "probe":
+		return errors.New("usage: xgift ops probe")
+	default:
+		return errors.New("ops expects show, set, reset or probe")
+	}
+}
+
+func opsShow(v *vault.Vault) error {
+	current, err := checkout.Describe(v)
+	if err != nil {
+		return err
+	}
+	source := "编译进程序的默认值"
+	if current.Overridden {
+		source = "覆盖值（存于加密库，重启后仍生效）"
+	}
+	fmt.Printf("X GraphQL 标识（来源：%s）\n", source)
+	printOp := func(name, id, defaultID string) {
+		tag := ""
+		if id != defaultID {
+			tag = "  ← 已覆盖（内置值 " + defaultID + "）"
+		}
+		fmt.Printf("  %-36s %s%s\n", name, id, tag)
+	}
+	printOp(checkout.OpPremiumGifting, current.PremiumGiftingQuery, checkout.DefaultOpPremiumGifting)
+	printOp(checkout.OpProductDetails, current.SubscriptionProductDetailsQuery, checkout.DefaultOpProductDetails)
+	printOp(checkout.OpOneTimeGiftMutation, current.OneTimePurchaseGiftMutation, checkout.DefaultOpOneTimeGiftMutation)
+	return nil
 }
 
 func runCards(v *vault.Vault, sub, last4 string) error {

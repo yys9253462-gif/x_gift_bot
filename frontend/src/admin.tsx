@@ -52,8 +52,23 @@ import { LookupPanel } from "./LookupPanel";
 import { RecoveryPanel } from "./RecoveryPanel";
 import { StatsPanel } from "./StatsPanel";
 import { ManualPaymentPanel } from "./ManualPaymentPanel";
+import { SettingsPanel } from "./SettingsPanel";
+import { AdminSidebar, type AdminPage } from "./AdminSidebar";
+import { Panel } from "./Panel";
 
 type Code = AdminCode;
+
+// 每页的标题与说明，跟着侧栏走。
+const PAGE_META: Record<AdminPage, { title: string; hint: string }> = {
+  codes: { title: "兑换码", hint: "生成兑换码、查看兑换状态和管理批次。" },
+  lookup: { title: "查询", hint: "按客户或按兑换码直接查到订单，无需按批次翻页。" },
+  credentials: { title: "X 登录凭据", hint: "下单时代替你在 X 上操作，凭据失效会导致兑换失败。" },
+  cards: { title: "支付卡", hint: "向 X 付款所用的卡池，下单时从可用卡中轮换选择。" },
+  catalog: { title: "商品与价格", hint: "告诉系统卖哪种会员、什么价。金额必须与 X 实际收取的一致。" },
+  outbounds: { title: "付款出站", hint: "下单与询价都走这里的出口。X 按出口所在国报价，要低价区就把出口放在那个国家。" },
+  proxy: { title: "查询出口", hint: "仅用于向 X 查询账号资格，不影响下单与定价。" },
+  ops: { title: "运维", hint: "付款节点状态、手动补单与统计概览。" },
+};
 type Listing = {
   folder: string;
   folders: Folder[];
@@ -113,6 +128,8 @@ function Admin() {
   const [countError, setCountError] = useState(false);
   const [focusTarget, setFocusTarget] = useState<"list" | null>(null);
   const [statsSignal, setStatsSignal] = useState(0);
+  // 侧栏分页：一页只干一件事，避免 9 个面板平铺成长长一条。
+  const [page, setPage] = useState<AdminPage>("codes");
   const listSequence = useRef(0);
   const mutation = useRef(false);
   const form = useRef<HTMLFormElement>(null);
@@ -357,68 +374,98 @@ function Admin() {
 
   return (
     <Shell admin>
-      <Stack
-        direction={{ xs: "column", sm: "row" }}
-        justifyContent="space-between"
-        alignItems={{ xs: "start", sm: "center" }}
-        spacing={2}
-        sx={{ mb: 4 }}
-      >
-        <Box>
-          <Typography
-            variant="h1"
-            sx={{ fontSize: { xs: 30, sm: 36 }, mt: 0.5 }}
-          >
-            兑换码管理
-          </Typography>
-          <Typography color="text.secondary" sx={{ mt: 1 }}>
-            生成兑换码、查看兑换状态和管理批次。
-          </Typography>
+      <Box sx={{ display: "flex", gap: { xs: 2, md: 3 }, alignItems: "flex-start" }}>
+        {/* 桌面端固定侧栏；窄屏隐藏（侧栏自身负责 sticky 定位） */}
+        <Box sx={{ display: { xs: "none", md: "block" } }}>
+          <AdminSidebar page={page} onNavigate={setPage} footNote="凭据加密存于本机保险库" />
         </Box>
-        <Stack direction="row" alignItems="center" spacing={1}>
-          <Chip
-            variant="outlined"
-            color={listing?.payments_enabled ? "success" : "default"}
-            label={
-              listing
-                ? listing.payments_enabled
-                  ? "充值已开放"
-                  : "用户充值入口已暂停"
-                : "正在获取服务状态"
-            }
-          />
-          <AppearanceMenu />
-        </Stack>
-      </Stack>
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: {
-            xs: "1fr",
-            md: "minmax(0, 1fr) minmax(0, 1fr)",
-          },
-          gap: 3,
-          mb: 3,
-          alignItems: "stretch",
-        }}
-      >
-        <CustomerPanel
-          selected={customerSelection}
-          onPrepare={(id, mode) =>
-            setRecoverySelection({ id, mode, seq: Date.now() })
-          }
-        />
-        <LookupPanel
-          disabled={busy || loading}
-          refreshSignal={statsSignal}
-          onCopy={(code) => void copyRow(code)}
-          onViewCustomer={(id) => setCustomerSelection({ id, seq: Date.now() })}
-          onRevoke={(code) => setConfirmation({ kind: "revoke", code })}
-        />
-      </Box>
-      <ManualPaymentPanel />
-      <RecoveryPanel selection={recoverySelection} />
-      <StatsPanel refreshSignal={statsSignal} />
+
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          {/* 当前页标题 + 全局状态 */}
+          <Stack
+            direction={{ xs: "column", sm: "row" }}
+            justifyContent="space-between"
+            alignItems={{ xs: "flex-start", sm: "center" }}
+            spacing={1.5}
+            sx={{ mb: 2.5 }}
+          >
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="h1" component="h1">
+                {PAGE_META[page].title}
+              </Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+                {PAGE_META[page].hint}
+              </Typography>
+            </Box>
+            <Stack direction="row" alignItems="center" spacing={1} sx={{ flexShrink: 0 }}>
+              <Chip
+                variant="outlined"
+                color={listing?.payments_enabled ? "success" : "default"}
+                icon={
+                  <Box
+                    aria-hidden="true"
+                    sx={{
+                      width: 7,
+                      height: 7,
+                      borderRadius: "50%",
+                      ml: 1.25,
+                      bgcolor: listing ? (listing.payments_enabled ? "success.main" : "text.disabled") : "warning.main",
+                    }}
+                  />
+                }
+                label={
+                  listing
+                    ? listing.payments_enabled
+                      ? "充值已开放"
+                      : "充值入口已暂停"
+                    : "正在获取状态"
+                }
+                sx={{ "& .MuiChip-icon": { mr: -0.25 } }}
+              />
+              <AppearanceMenu />
+            </Stack>
+          </Stack>
+
+          {/* 配置类页面：每个分区由左侧导航单独进入，同一组件按 section 渲染 */}
+          {(page === "credentials" || page === "cards" || page === "catalog" || page === "outbounds" || page === "proxy") && (
+            <SettingsPanel section={page} />
+          )}
+
+          {page === "lookup" && (
+            <Box
+              sx={{
+                display: "grid",
+                gridTemplateColumns: { xs: "1fr", md: "minmax(0, 1fr) minmax(0, 1fr)" },
+                gap: 3,
+                alignItems: "stretch",
+              }}
+            >
+              <CustomerPanel
+                selected={customerSelection}
+                onPrepare={(id, mode) =>
+                  setRecoverySelection({ id, mode, seq: Date.now() })
+                }
+              />
+              <LookupPanel
+                disabled={busy || loading}
+                refreshSignal={statsSignal}
+                onCopy={(code) => void copyRow(code)}
+                onViewCustomer={(id) => setCustomerSelection({ id, seq: Date.now() })}
+                onRevoke={(code) => setConfirmation({ kind: "revoke", code })}
+              />
+            </Box>
+          )}
+
+          {page === "ops" && (
+            <Box sx={{ display: "grid", gap: 3 }}>
+              <ManualPaymentPanel />
+              <RecoveryPanel selection={recoverySelection} />
+              <StatsPanel refreshSignal={statsSignal} />
+            </Box>
+          )}
+
+          {page === "codes" && (
+            <>
       <FolderPanel
         folders={listing?.folders ?? []}
         stats={listing?.stats}
@@ -462,33 +509,13 @@ function Admin() {
           表达式筛选生效中，点击批次文件夹可清除筛选并查看该批次。
         </Typography>
       )}
-      <FilterBar
-        value={expression}
-        onChange={(value) => {
-          setExpression(value);
-          if (filterError) setFilterError("");
-        }}
-        onApply={() => {
-          if (expression.trim()) void applyFilter(expression.trim());
-        }}
-        onClear={() => clearFilter()}
-        applied={!!activeFilter}
-        error={filterError}
-        disabled={busy || loading}
-        folders={listing?.folders ?? []}
-        appliedSource={activeFilter?.source ?? ""}
-        resultCount={activeFilter ? filterTotal : undefined}
-        applySeq={applySeq}
-        clearNotice={clearNotice}
-      />
-      <Paper variant="outlined" sx={{ p: { xs: 2.5, sm: 3 }, mb: 3 }}>
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
-          <ConfirmationNumberOutlined color="primary" />
-          <Typography variant="h2">生成兑换码</Typography>
-        </Stack>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-          每批最多 500 枚。同名批次自动归入同一个文件夹。
-        </Typography>
+      <Panel
+        id="generate-codes"
+        icon={<ConfirmationNumberOutlined fontSize="small" />}
+        title="生成兑换码"
+        hint="每批最多 500 枚。同名批次自动归入同一个文件夹。"
+        sx={{ mb: 3 }}
+      >
         <Box
           component="form"
           ref={form}
@@ -579,7 +606,27 @@ function Admin() {
             </Button>
           </Box>
         </Box>
-      </Paper>
+      </Panel>
+
+      <FilterBar
+        value={expression}
+        onChange={(value) => {
+          setExpression(value);
+          if (filterError) setFilterError("");
+        }}
+        onApply={() => {
+          if (expression.trim()) void applyFilter(expression.trim());
+        }}
+        onClear={() => clearFilter()}
+        applied={!!activeFilter}
+        error={filterError}
+        disabled={busy || loading}
+        folders={listing?.folders ?? []}
+        appliedSource={activeFilter?.source ?? ""}
+        resultCount={activeFilter ? filterTotal : undefined}
+        applySeq={applySeq}
+        clearNotice={clearNotice}
+      />
       {notice && (
         <Alert
           severity={notice.error ? "error" : "success"}
@@ -625,27 +672,19 @@ function Admin() {
           </Stack>
         </Paper>
       )}
-      <Paper variant="outlined" sx={{ overflow: "hidden" }}>
-        <Stack
-          direction="row"
-          justifyContent="space-between"
-          alignItems="center"
-          sx={{ px: { xs: 2, sm: 3 }, py: 2 }}
-        >
-          <Box>
-            <Typography variant="h2">
-              {matched
-                ? "表达式筛选结果"
-                : listing?.folder === "unfiled"
-                  ? "未分类"
-                  : (listing?.folders.find(
-                      (folder) => folder.id === listing.folder,
-                    )?.name ?? "全部兑换码")}
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              点击条目复制兑换码 · 每页最多 100 条
-            </Typography>
-          </Box>
+      <Panel
+        id="code-list"
+        dense
+        title={
+          matched
+            ? "表达式筛选结果"
+            : listing?.folder === "unfiled"
+              ? "未分类"
+              : (listing?.folders.find((folder) => folder.id === listing.folder)?.name ?? "全部兑换码")
+        }
+        hint="点击条目复制兑换码 · 每页最多 100 条"
+        sx={{ overflow: "hidden" }}
+        actions={
           <Tooltip describeChild title="刷新列表">
             <span>
               <IconButton
@@ -664,7 +703,8 @@ function Admin() {
               </IconButton>
             </span>
           </Tooltip>
-        </Stack>
+        }
+      >
         {loading && <LinearProgress aria-label="正在加载兑换码" />}
         {listError && (
           <Alert severity="error" role="alert" sx={{ m: 2 }}>
@@ -1011,7 +1051,7 @@ function Admin() {
             </>
           )}
         </Stack>
-      </Paper>
+      </Panel>
       <Dialog
         open={moveOpen}
         disableRestoreFocus={focusTarget !== null}
@@ -1111,6 +1151,10 @@ function Admin() {
         message={copyNotice}
         slotProps={{ content: { role: "status" } }}
       />
+          </>
+        )}
+        </Box>
+      </Box>
     </Shell>
   );
 }

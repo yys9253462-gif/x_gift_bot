@@ -526,9 +526,6 @@ func (s *server) runRecovery(id, binding string) {
 		}
 	}
 }
-func (s *server) recoverOne(item recoveryItem, binding string) (state, detail string, stop bool) {
-	return s.recoverOneOptions(item, binding, "pay", false)
-}
 func (s *server) recoverOneOptions(item recoveryItem, binding, mode string, verified bool) (state, detail string, stop bool) {
 	if mode != "links" {
 		_, _, current, err := checkout.CardSummary(s.vault)

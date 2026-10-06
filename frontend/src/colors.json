@@ -41,13 +41,13 @@
   "dark": {
     "primary": {
       "main": "#AAC7FF",
-      "light": "#D6E3FF",
+      "light": "#2A3A55",
       "dark": "#7BA4DF",
       "contrastText": "#0A305F"
     },
     "secondary": {
       "main": "#FAAFE0",
-      "light": "#FFD7EF",
+      "light": "#4A2A42",
       "dark": "#DB94C3",
       "contrastText": "#511F48"
     },

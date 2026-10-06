@@ -56,7 +56,9 @@ func ProbePaymentOutbounds(ctx context.Context, v *vault.Vault, report func(Paym
 				result.Error = "stripe_connect_failed"
 				return
 			}
-			io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
+			// 必须读到 EOF 再 Close：只读前 4096 字节就关，
+			// 剩下的响应体会让连接无法正常归还。
+			io.Copy(io.Discard, io.LimitReader(res.Body, 256<<10))
 			res.Body.Close()
 			result.StripeHTTP = res.StatusCode
 			result.Healthy = res.StatusCode == 404

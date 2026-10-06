@@ -283,7 +283,7 @@ function App() {
   }
 
   return (
-    <Shell maxWidth="md">
+    <Shell maxWidth={900}>
       <Box
         sx={{
           display: "grid",

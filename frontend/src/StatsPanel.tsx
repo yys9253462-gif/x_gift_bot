@@ -16,16 +16,26 @@ import ExpandMoreRounded from "@mui/icons-material/ExpandMoreRounded";
 import QueryStatsRounded from "@mui/icons-material/QueryStatsRounded";
 import { stats as fetchStats, type AdminStatsDetail } from "./adminApi";
 
+// 本地这份 visuallyHidden 原来只有 clip: rect(0 0 0 0)。
+// 旧式 clip 在现代浏览器里裁剪不可靠：当内部的「最近 30 天」表格
+// 比这个 1px 容器高时会把父级撑开 —— 实测让运维页多了 604px 空白
+// （documentElement 2488 / body 1884，差额全部来自这张表）。
+// 改用 MUI 官方写法：clipPath: inset(50%) 能可靠裁剪。
+// 另外显式加 contain: "size layout"，让这块无障碍表格完全不参与
+// 父容器的高度计算 —— 它是给屏幕阅读器用的，视觉上不存在，
+// 就不该影响布局（实测它单独撑出 1022px）。
 const visuallyHidden = {
   position: "absolute",
   width: "1px",
   height: "1px",
+  maxHeight: "1px",
   p: 0,
   m: "-1px",
   overflow: "hidden",
-  clip: "rect(0 0 0 0)",
+  clipPath: "inset(50%)",
   whiteSpace: "nowrap",
   border: 0,
+  contain: "size layout",
 } as const;
 
 function StatCard({
@@ -244,7 +254,9 @@ export function StatsPanel({ refreshSignal }: { refreshSignal: number }) {
   // Neutral track color that stays calm on dark surfaces (primary.light does not).
   const remainder = theme.vars.palette.divider;
   return (
-    <Paper variant="outlined" sx={{ mb: 3, overflow: "hidden" }}>
+    <Paper variant="outlined" sx={{ mb: 3, overflow: "hidden", borderRadius: 2.5 }}>
+      {/* 标题栏与 Panel 保持一致的浅底 + 分隔线，避免同页两种风格 */}
+      <Box sx={{ bgcolor: "action.hover", borderBottom: expanded ? 1 : 0, borderColor: "divider" }}>
       <Button
         fullWidth
         aria-expanded={expanded}
@@ -252,15 +264,25 @@ export function StatsPanel({ refreshSignal }: { refreshSignal: number }) {
         onClick={() => setExpanded((value) => !value)}
         sx={{
           justifyContent: "flex-start",
-          gap: 1,
-          px: { xs: 2.5, sm: 3 },
+          gap: 1.25,
+          px: { xs: 2, sm: 2.5 },
           py: 1.5,
           borderRadius: 0,
           color: "text.primary",
+          "&:hover": { bgcolor: "transparent" },
         }}
       >
-        <QueryStatsRounded color="primary" />
-        <Typography variant="h2" component="span" sx={{ flexGrow: 1, textAlign: "left" }}>
+        <Box
+          aria-hidden="true"
+          sx={{
+            width: 26, height: 26, borderRadius: 1.25, display: "grid", placeItems: "center",
+            bgcolor: "background.paper", color: "primary.main", border: 1, borderColor: "divider",
+            "& svg": { fontSize: 16 },
+          }}
+        >
+          <QueryStatsRounded fontSize="inherit" />
+        </Box>
+        <Typography variant="h2" component="span" sx={{ flexGrow: 1, textAlign: "left", fontSize: 15.5, fontWeight: 650 }}>
           统计概览
         </Typography>
         {data && (
@@ -276,6 +298,7 @@ export function StatsPanel({ refreshSignal }: { refreshSignal: number }) {
           })}
         />
       </Button>
+      </Box>
       <Collapse in={expanded} timeout={reducedMotion ? 0 : undefined}>
         <Box
           id="stats-panel-content"

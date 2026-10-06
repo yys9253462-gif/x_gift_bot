@@ -1,0 +1,40 @@
+# 默认按文本处理
+* text=auto
+# 规则文件自身保持 LF，否则每次 git add 都会警告行尾将被替换。
+.gitattributes text eol=lf
+
+# ---- 源码与脚本：强制 LF ----
+# Go 源码若检出成 CRLF，会让 gofmt -l 把每个文件都报成未格式化，
+# 也让本地与服务器的 md5sum 对不上，掩盖真正的代码不同步。
+*.go    text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.sh    text eol=lf
+*.bash  text eol=lf
+*.py    text eol=lf
+# HTML 模板会被 build.mjs 原样嵌入 go:embed，检出成 CRLF 会把 CR 带进产物。
+*.html  text eol=lf
+
+# ---- 部署配置：必须是 LF ----
+# systemd unit 带 CR 会直接解析失败；Caddyfile 同理。
+*.service text eol=lf
+Caddyfile* text eol=lf
+Dockerfile* text eol=lf
+
+# ---- 文档与数据 ----
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+
+# ---- 二进制：禁止任何文本转换 ----
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.gz    binary
+*.tar   binary
+*.db    binary

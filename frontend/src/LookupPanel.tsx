@@ -5,12 +5,12 @@ import {
   Button,
   Chip,
   CircularProgress,
-  Paper,
   Stack,
   TextField,
   Typography,
 } from "@mui/material";
 import ManageSearchRounded from "@mui/icons-material/ManageSearchRounded";
+import { Panel } from "./Panel";
 import { adminApi, formatTime, type AdminCode } from "./adminApi";
 import { codeStatus } from "./codeStatus";
 
@@ -91,18 +91,13 @@ export function LookupPanel({
     : [];
 
   return (
-    <Paper
-      variant="outlined"
-      component="section"
-      aria-labelledby="lookup-title"
-      sx={{ p: { xs: 2, sm: 3 }, height: "100%" }}
+    <Panel
+      id="lookup"
+      icon={<ManageSearchRounded fontSize="small" />}
+      title="按兑换码查询"
+      hint="粘贴客户提供的完整兑换码，直接查看状态、批次和接收账号，无需按批次翻页。"
+      sx={{ height: "100%", display: "flex", flexDirection: "column" }}
     >
-      <Stack direction="row" spacing={1} alignItems="center">
-        <ManageSearchRounded color="primary" aria-hidden="true" />
-        <Typography id="lookup-title" variant="h2" sx={{ fontSize: 21 }}>
-          按兑换码查询
-        </Typography>
-      </Stack>
       <Box
         component="form"
         noValidate
@@ -110,7 +105,6 @@ export function LookupPanel({
           event.preventDefault();
           submit();
         }}
-        sx={{ mt: 2 }}
       >
         <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
           <TextField
@@ -152,9 +146,6 @@ export function LookupPanel({
           </Button>
         </Stack>
       </Box>
-      <Typography variant="body2" color="text.secondary">
-        粘贴客户提供的完整兑换码，直接查看状态、批次和接收账号，无需按批次翻页。
-      </Typography>
       {error && (
         <Alert severity="error" role="alert" sx={{ mt: 2 }}>
           {error}
@@ -276,6 +267,6 @@ export function LookupPanel({
           </Box>
         )}
       </Box>
-    </Paper>
+    </Panel>
   );
 }

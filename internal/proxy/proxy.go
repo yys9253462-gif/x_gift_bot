@@ -54,7 +54,9 @@ func Start(ctx context.Context, config []byte, port int) (*box.Box, error) {
 
 func Check(ctx context.Context, port int) error {
 	p, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
-	tr := &http.Transport{Proxy: http.ProxyURL(p), TLSHandshakeTimeout: 15 * time.Second}
+	// 这是一次性连通性探测，用完即弃；defer CloseIdleConnections 只关空闲连接，
+	// 不如直接禁用 keep-alive 来得干净。
+	tr := &http.Transport{Proxy: http.ProxyURL(p), DisableKeepAlives: true, TLSHandshakeTimeout: 15 * time.Second}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 25 * time.Second}
 	req, _ := http.NewRequestWithContext(ctx, "HEAD", "https://x.com", nil)

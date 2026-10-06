@@ -99,7 +99,10 @@ func newStripe(ctx context.Context, v *vault.Vault, recipient string, mode payme
 		}
 	}
 	// Missing/empty pool is direct; an assigned order never silently falls back.
-	client := &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
+	// 这个 client 每次结算新建、用完即弃，没有连接复用价值：
+	// 必须禁掉 keep-alive，否则每个 client 都会留一条连接到它的 GC 才回收。
+	// 同类 bug 曾实测泄漏 5760 条/天（约 12 天打满 ulimit 65535）。
+	client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
 	closeRoute := func() { client.CloseIdleConnections() }
 	if route != nil {
 		client, closeRoute, e = proxy.OpenOutbound(ctx, route.Outbound)

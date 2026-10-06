@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <style nonce="__XGIFT_NONCE__">
+      :root {
+        --bg: #f4f8fd;
+        --card: #ffffff;
+        --ink: #12314f;
+        --muted: #5b7690;
+        --line: #d8e4f0;
+        --brand: #1f6fb2;
+        --brand-ink: #ffffff;
+        --ok: #1c7a4d;
+        --bad: #b3261e;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1826;
+          --card: #14243a;
+          --ink: #e8f1fb;
+          --muted: #9db4cc;
+          --line: #26405e;
+          --brand: #4c9be0;
+          --brand-ink: #06121f;
+          --ok: #62d29b;
+          --bad: #ff8a80;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 32px 16px 72px;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+      main { max-width: 780px; margin: 0 auto; }
+      h1 { font-size: 24px; margin: 0 0 6px; }
+      .lead { color: var(--muted); margin: 0 0 24px; }
+      section {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 18px 20px;
+        margin-bottom: 16px;
+      }
+      h2 { font-size: 16px; margin: 0 0 4px; }
+      .hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+      label { display: block; margin-bottom: 12px; font-size: 13px; }
+      /* hidden 属于用户代理样式表，优先级最低，会被上面 label 的
+         display:block 直接压过去。必须显式声明，否则隐藏根本不生效。 */
+      [hidden] { display: none !important; }
+      label span { display: block; margin-bottom: 4px; color: var(--muted); }
+      input, select, textarea {
+        width: 100%;
+        padding: 9px 11px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--ink);
+        font: inherit;
+        font-size: 14px;
+      }
+      textarea { min-height: 96px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0 14px; }
+      button {
+        background: var(--brand);
+        color: var(--brand-ink);
+        border: 0;
+        border-radius: 9px;
+        padding: 11px 18px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: .55; cursor: progress; }
+      .note {
+        margin-top: 14px;
+        padding: 12px 14px;
+        border-radius: 9px;
+        border: 1px solid var(--line);
+        display: none;
+        white-space: pre-wrap;
+      }
+      .note.bad { display: block; border-color: var(--bad); color: var(--bad); }
+      .note.ok { display: block; border-color: var(--ok); color: var(--ok); }
+      footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 28px; }
+    </style>
+    <title>XGift · 站点初始化</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  </head>
+  <body>
+    <main>
+      <h1>XGift 站点初始化</h1>
+      <p class="lead">
+        本页面只在本机尚未初始化时可用。提交后凭据会写入加密保险库，本页面将永久关闭。
+      </p>
+
+      <section>
+        <h2>1. 初始化密码</h2>
+        <p class="hint">部署时生成的一次性口令，用于确认是本人在配置。填错可重试，不影响已保存的内容。</p>
+        <label>
+          <span>初始化密码</span>
+          <input id="setup_password" type="password" autocomplete="off" required />
+        </label>
+      </section>
+
+      <section>
+        <h2>2. X 登录凭据</h2>
+        <p class="hint">
+          最省事的做法：在浏览器里打开 x.com，从开发者工具把 Cookie 整串复制过来，粘进下面这个框，
+          会自动拆出 auth_token 与 ct0。也可以按 JSON 形式粘贴（见下）。
+        </p>
+        <label>
+          <span>粘贴整串 Cookie / JSON（自动填充下面两项）</span>
+          <textarea id="cookie_paste" rows="3" spellcheck="false"
+            placeholder="auth_token=abc123...; ct0=def456...&#10;或：{&quot;auth_token&quot;:&quot;abc123&quot;,&quot;ct0&quot;:&quot;def456&quot;}"></textarea>
+        </label>
+        <p class="hint" id="paste_note"></p>
+        <label>
+          <span>auth_token</span>
+          <input id="auth_token" type="text" autocomplete="off" spellcheck="false" required />
+        </label>
+        <label>
+          <span>ct0</span>
+          <input id="ct0" type="text" autocomplete="off" spellcheck="false" required />
+        </label>
+        <div class="grid">
+          <label>
+            <span>Authorization（留空用默认）</span>
+            <input id="authorization" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>
+            <span>User-Agent（留空用默认）</span>
+            <input id="user_agent" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>3. 支付卡</h2>
+        <p class="hint">卡号、有效期、CVC 会做 Luhn 与过期校验，不合法会整批拒绝。</p>
+        <label>
+          <span>卡号</span>
+          <input id="card_number" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" required />
+        </label>
+        <div class="grid">
+          <label>
+            <span>有效期月（01-12）</span>
+            <input id="card_exp_month" type="text" inputmode="numeric" placeholder="09" required />
+          </label>
+          <label>
+            <span>有效期年（4 位）</span>
+            <input id="card_exp_year" type="text" inputmode="numeric" placeholder="2029" required />
+          </label>
+          <label>
+            <span>CVC</span>
+            <input id="card_cvc" type="text" inputmode="numeric" autocomplete="off" required />
+          </label>
+        </div>
+        <div class="grid">
+          <label>
+            <span>持卡人姓名</span>
+            <input id="card_name" type="text" autocomplete="off" required />
+          </label>
+          <label>
+            <span>邮箱</span>
+            <input id="card_email" type="email" autocomplete="off" required />
+          </label>
+          <label>
+            <span>账单国家（如 US）</span>
+            <input id="card_country" type="text" placeholder="US" required />
+          </label>
+        </div>
+        <div class="grid">
+          <label>
+            <span>邮编（可选）</span>
+            <input id="card_postal" type="text" autocomplete="off" />
+          </label>
+          <label>
+            <span>城市（可选）</span>
+            <input id="card_city" type="text" autocomplete="off" />
+          </label>
+          <label>
+            <span>州（可选）</span>
+            <input id="card_state" type="text" autocomplete="off" />
+          </label>
+        </div>
+        <div class="grid">
+          <label>
+            <span>地址第一行（可选）</span>
+            <input id="card_line1" type="text" autocomplete="off" />
+          </label>
+          <label>
+            <span>地址第二行（可选）</span>
+            <input id="card_line2" type="text" autocomplete="off" />
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>4. Stripe 与套餐</h2>
+        <div class="label-wrap">
+          <label>
+            <span>Stripe 公钥（pk_test_… 或 pk_live_…）</span>
+            <input id="stripe_key" type="text" autocomplete="off" spellcheck="false" required />
+          </label>
+        </div>
+        <div class="grid">
+          <label>
+            <span>商户账号（acct_…）</span>
+            <input id="merchant" type="text" autocomplete="off" spellcheck="false" required />
+          </label>
+          <label>
+            <span>币种（小写，如 usd）</span>
+            <input id="currency" type="text" autocomplete="off" spellcheck="false" required />
+          </label>
+        </div>
+        <div class="grid">
+          <label>
+            <span>套餐 1 月数</span>
+            <input id="plan1_months" type="number" value="3" min="1" max="24" required />
+          </label>
+          <label>
+            <span>套餐 1 金额（主单位）</span>
+            <input id="plan1_amount" type="text" placeholder="300" required />
+          </label>
+          <label>
+            <span>套餐 1 商品（prod_…）</span>
+            <input id="plan1_product" type="text" autocomplete="off" spellcheck="false" required />
+          </label>
+        </div>
+        <div class="grid">
+          <label>
+            <span>套餐 2 月数（可留空）</span>
+            <input id="plan2_months" type="number" min="1" max="24" />
+          </label>
+          <label>
+            <span>套餐 2 金额</span>
+            <input id="plan2_amount" type="text" placeholder="600" />
+          </label>
+          <label>
+            <span>套餐 2 商品</span>
+            <input id="plan2_product" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+        </div>
+      </section>
+
+      <section>
+        <h2>5. 出站网络</h2>
+        <p class="hint">默认直连；若上游需要代理，可粘贴已导出的 sing-box 配置 JSON。</p>
+        <label>
+          <span>方式</span>
+          <select id="proxy_mode">
+            <option value="direct">直连</option>
+            <option value="json">粘贴 sing-box 配置</option>
+          </select>
+        </label>
+        <label id="proxy_json_wrap" hidden>
+          <span>代理配置 JSON</span>
+          <textarea id="proxy_json" spellcheck="false"></textarea>
+        </label>
+      </section>
+
+      <section>
+        <h2>6. 管理后台密码</h2>
+        <p class="hint">管理后台使用 HTTP Basic Auth，用户名固定为 admin。至少 32 个字符。</p>
+        <label>
+          <span>管理员密码</span>
+          <input id="admin_password" type="password" autocomplete="new-password" required />
+        </label>
+        <label>
+          <span>确认管理员密码</span>
+          <input id="admin_password_confirm" type="password" autocomplete="new-password" required />
+        </label>
+      </section>
+
+      <button id="submit" type="button">保存并完成初始化</button>
+      <div id="note" class="note"></div>
+    </main>
+    <footer>凭据加密后存入本机保险库，不会随响应回传。</footer>
+    <script src="/setup.js"></script>
+  </body>
+</html>

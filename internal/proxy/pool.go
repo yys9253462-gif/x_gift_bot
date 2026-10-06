@@ -67,7 +67,10 @@ func OpenOutbound(ctx context.Context, node stdjson.RawMessage) (*http.Client, f
 		return nil, nil, errors.New("invalid outbound")
 	}
 	if meta.Type == "direct" {
-		client := &http.Client{Transport: &http.Transport{Proxy: nil, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
+		// 每次询价/结算都新建一个 client，用完即弃 —— 没有连接复用价值。
+		// 必须 DisableKeepAlives，否则每个 client 都会留一条空闲连接到 GC，
+		// 调用频率高时会线性堆积（实测同类 bug 5760 条/天）。
+		client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
 		return client, func() { client.CloseIdleConnections() }, nil
 	}
 	raw, err := stdjson.Marshal(map[string]any{"outbounds": []stdjson.RawMessage{node}})
@@ -86,7 +89,9 @@ func OpenOutbound(ctx context.Context, node stdjson.RawMessage) (*http.Client, f
 		return nil, nil, errors.New("cannot start payment outbound; check node fields and build with with_quic,with_utls")
 	}
 	p, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
-	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(p), TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
+	// 同上：这个 client 随 node 生命周期存在，但一次询价后就 close，
+	// 保留 keep-alive 只会让它多占一条连接。
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(p), DisableKeepAlives: true, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 35 * time.Second}
 	close := func() { client.CloseIdleConnections(); instance.Close() }
 	return client, close, nil
 }

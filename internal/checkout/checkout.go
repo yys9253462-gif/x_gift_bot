@@ -149,6 +149,13 @@ func run(ctx context.Context, v *vault.Vault, user, expectedRecipient string, pa
 		}
 	}
 	progress(ctx, 40, "正在核对套餐时长和价格…")
+	// 询价与创建订单必须走付款出口：X 按请求出口所在国定价，若沿用账号
+	// 查询出口（通常直连）就会按服务器所在国报价，随后在 quote() 里因
+	// 金额不符被拒，而错误信息只说"price is not exactly the allowed amount"。
+	// 此时 recipient 已确定，可以按它选到与结算相同的节点。
+	if e = x.withRegionalExit(ctx, recipient); e != nil {
+		return nil, e
+	}
 	if e = x.quote(ctx, user, plan); e != nil {
 		return nil, e
 	}

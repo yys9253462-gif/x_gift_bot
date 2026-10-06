@@ -12,10 +12,13 @@ import {
   Typography,
 } from "@mui/material";
 import type { Theme } from "@mui/material";
+import { Collapse } from "@mui/material";
 import type { SystemStyleObject } from "@mui/system";
 import { visuallyHidden } from "@mui/utils";
 import BackspaceOutlined from "@mui/icons-material/BackspaceOutlined";
 import CodeOutlined from "@mui/icons-material/CodeOutlined";
+import ExpandLessOutlined from "@mui/icons-material/ExpandLessOutlined";
+import ExpandMoreOutlined from "@mui/icons-material/ExpandMoreOutlined";
 import FilterAltOutlined from "@mui/icons-material/FilterAltOutlined";
 import PaletteOutlined from "@mui/icons-material/PaletteOutlined";
 import type { Folder } from "./adminApi";
@@ -310,6 +313,8 @@ export function FilterBar({
     setAnnounce((current) => ({ seq: current.seq + 1, text }));
   const [desyncWarning, setDesyncWarning] = useState("");
   const [username, setUsername] = useState("");
+  // 高级筛选日常不用，默认收起，避免占着 400px 把列表压到下面。
+  const [expanded, setExpanded] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
 
   // 外部 value 变化（如清除、文本模式往返）时重新同步词元；
@@ -489,10 +494,10 @@ export function FilterBar({
         direction="row"
         spacing={1}
         alignItems="center"
-        sx={{ mb: 0.5, flexWrap: "wrap", rowGap: 0.5 }}
+        sx={{ mb: expanded ? 0.5 : 0, flexWrap: "wrap", rowGap: 0.5 }}
       >
         <FilterAltOutlined color="primary" sx={{ flexShrink: 0 }} />
-        <Typography variant="h2" sx={{ whiteSpace: "nowrap", flexShrink: 0, fontSize: 21 }}>
+        <Typography variant="h2" component="h2" sx={{ whiteSpace: "nowrap", flexShrink: 0, fontSize: 17, fontWeight: 600 }}>
           高级筛选
         </Typography>
         {applied && (
@@ -509,20 +514,37 @@ export function FilterBar({
         <Button
           variant="text"
           size="small"
-          startIcon={mode === "palette" ? <CodeOutlined /> : <PaletteOutlined />}
-          aria-label={
-            mode === "palette" ? "切换到文本模式" : "切换到调色板模式"
-          }
+          startIcon={expanded ? <ExpandLessOutlined /> : <ExpandMoreOutlined />}
+          aria-expanded={expanded}
+          aria-controls="filter-body"
           onClick={() => {
             setDesyncWarning("");
-            setMode((current) => (current === "palette" ? "text" : "palette"));
+            setExpanded((v) => !v);
           }}
           sx={{ minHeight: 36, px: 1.5, flexShrink: 0 }}
         >
-          {mode === "palette" ? "文本模式" : "调色板"}
+          {expanded ? "收起" : "展开"}
         </Button>
+        {expanded && (
+          <Button
+            variant="text"
+            size="small"
+            startIcon={mode === "palette" ? <CodeOutlined /> : <PaletteOutlined />}
+            aria-label={
+              mode === "palette" ? "切换到文本模式" : "切换到调色板模式"
+            }
+            onClick={() => {
+              setDesyncWarning("");
+              setMode((current) => (current === "palette" ? "text" : "palette"));
+            }}
+            sx={{ minHeight: 36, px: 1.5, flexShrink: 0 }}
+          >
+            {mode === "palette" ? "文本模式" : "调色板"}
+          </Button>
+        )}
       </Stack>
-      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+      <Collapse in={expanded} id="filter-body">
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 2, mt: 0.5 }}>
         组合批次与状态条件，在所有兑换码中筛选。
       </Typography>
       {mode === "text" ? (
@@ -992,6 +1014,7 @@ export function FilterBar({
       >
         {announce.text}
       </Box>
+      </Collapse>
     </Paper>
   );
 }

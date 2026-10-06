@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, Box, Button, Checkbox, FormControlLabel, LinearProgress, MenuItem, Paper, Stack, TextField, Typography } from "@mui/material";
+import { Alert, Box, Button, Checkbox, FormControlLabel, LinearProgress, MenuItem, Stack, TextField, Typography } from "@mui/material";
 import LinkRounded from "@mui/icons-material/LinkRounded";
 import ContentCopyOutlined from "@mui/icons-material/ContentCopyOutlined";
 import OpenInNewRounded from "@mui/icons-material/OpenInNewRounded";
 import { adminApi } from "./adminApi";
+import { Panel } from "./Panel";
 import { request } from "./shared";
 
 type Plan = { months: number; amount: number; currency: string };
@@ -24,14 +25,24 @@ export function ManualPaymentPanel({ publicMode = false }: { publicMode?: boolea
   const inFlight = useRef(false);
   const cleanUser = username.trim().replace(/^@/, "").toLowerCase();
   const valid = /^[a-z0-9_]{1,15}$/.test(cleanUser);
+  // 套餐取不到通常不是"坏了"，而是这台站没配 Stripe（只跑兑换码）。
+  // 用户页仍需原样报错，后台则换成中性说明，免得管理员以为站点故障。
+  const [plansMissing, setPlansMissing] = useState(false);
   async function loadPlans() {
     setPlanError("");
+    setPlansMissing(false);
     try {
       const data = await adminApi<{ plans: Plan[] }>(endpoint + "/plans");
       setPlans(data.plans);
       setMonths(data.plans.some((p) => p.months === 6) ? 6 : (data.plans[0]?.months ?? 0));
-      if (!data.plans.length) setPlanError("暂无可用套餐。");
-    } catch (e) { setPlanError((e as Error).message); }
+      if (!data.plans.length) {
+        if (publicMode) setPlanError("暂无可用套餐。");
+        else setPlansMissing(true);
+      }
+    } catch (e) {
+      if (publicMode) setPlanError((e as Error).message);
+      else setPlansMissing(true);
+    }
   }
   useEffect(() => { void loadPlans(); }, []);
   function reset() { setResult(null); setError(""); setNotice(""); setNeedsVerification(false); setVerified(false); }
@@ -50,15 +61,33 @@ export function ManualPaymentPanel({ publicMode = false }: { publicMode?: boolea
     try { await navigator.clipboard.writeText(result.checkout_url); setNotice("付款链接已复制。"); }
     catch { setNotice("复制失败，请选中下方链接手动复制。"); }
   }
-  return (
-    <Paper variant="outlined" component="section" aria-labelledby="manual-payment-title" sx={{ p: publicMode ? 0 : { xs: 2, sm: 3 }, mb: publicMode ? 0 : 3, ...(publicMode ? { border: 0, bgcolor: "transparent" } : {}) }}>
-      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
-        <LinkRounded color="primary" aria-hidden="true" />
-        <Typography id="manual-payment-title" variant="h2" sx={{ fontSize: 21 }}>手动付款链接</Typography>
-      </Stack>
-      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>{publicMode ? "填写接收人的 X 用户名并选择时长，无需兑换码。生成后前往 Stripe 自行填写付款卡；生成链接不会自动扣款。请保留付款页面，不要重复支付。" : "填写 X 用户名和套餐时长，生成 Stripe 链接后手动付款，无需兑换码。"}</Typography>
+  // 后台模式统一走 Panel（标题栏 + 语义 section），前台保持原来的内嵌样式。
+  const heading = publicMode ? (
+    <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+      <LinkRounded color="primary" aria-hidden="true" />
+      <Typography id="manual-payment-title" variant="h2" component="h2" sx={{ fontSize: 18 }}>手动付款链接</Typography>
+    </Stack>
+  ) : null;
+  const body = (
+    <>
+      {heading}
+      {publicMode && (
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          填写接收人的 X 用户名并选择时长，无需兑换码。生成后前往 Stripe 自行填写付款卡；生成链接不会自动扣款。请保留付款页面，不要重复支付。
+        </Typography>
+      )}
       {planError && <Alert severity="error" sx={{ mb: 2 }} action={<Button color="inherit" onClick={() => void loadPlans()}>重新加载</Button>}>{planError}</Alert>}
-      <Box component="form" onSubmit={(e) => { e.preventDefault(); void generate(); }} aria-busy={busy}>
+      {plansMissing && (
+        <Alert
+          severity="info"
+          sx={{ mb: 2 }}
+          action={<Button color="inherit" onClick={() => void loadPlans()}>重新检查</Button>}
+        >
+          本机尚未配置 Stripe 套餐，因此无法生成付款链接。只跑兑换码时这是正常的；
+          想启用在线收款，请到左侧「站点设置 → Stripe 与套餐」填写公钥、商户账号与套餐。
+        </Alert>
+      )}
+      <Box component="form" onSubmit={(e) => { e.preventDefault(); void generate(); }} aria-busy={busy} sx={plansMissing ? { opacity: 0.5, pointerEvents: "none" } : undefined} aria-disabled={plansMissing}>
         <Box sx={{
           display: "grid",
           gridTemplateColumns: { xs: "minmax(0, 1fr)", sm: "minmax(0, 1fr) minmax(0, 1fr)", md: publicMode ? "minmax(0, 1fr) minmax(0, 1fr)" : "minmax(260px, 1fr) minmax(235px, 320px) auto" },
@@ -87,6 +116,19 @@ export function ManualPaymentPanel({ publicMode = false }: { publicMode?: boolea
         </>}
       </Box>}
       {notice && <Alert severity="info" sx={{ mt: 2 }} onClose={() => setNotice("")}>{notice}</Alert>}
-    </Paper>
+    </>
+  );
+  if (publicMode) {
+    return <Box component="section" aria-labelledby="manual-payment-title">{body}</Box>;
+  }
+  return (
+    <Panel
+      id="manual-payment"
+      icon={<LinkRounded fontSize="small" />}
+      title="手动付款链接"
+      hint="填写 X 用户名和套餐时长，生成 Stripe 链接后手动付款，无需兑换码。"
+    >
+      {body}
+    </Panel>
   );
 }

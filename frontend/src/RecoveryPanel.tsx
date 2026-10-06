@@ -13,7 +13,6 @@ import {
   DialogContent,
   DialogTitle,
   FormControlLabel,
-  Paper,
   Stack,
   Table,
   TableBody,
@@ -24,6 +23,8 @@ import {
   Typography,
 } from "@mui/material";
 import ExpandMoreRounded from "@mui/icons-material/ExpandMoreRounded";
+import BuildOutlined from "@mui/icons-material/BuildOutlined";
+import { Panel } from "./Panel";
 import { adminApi, formatTime } from "./adminApi";
 import type { RecoverySelection } from "./CustomerPanel";
 import {
@@ -351,32 +352,19 @@ export function RecoveryPanel({
         rotation={rotation}
         failed={!!statusError}
       />
-      <Paper
-        component="section"
-        aria-labelledby="recovery-panel-title"
-        variant="outlined"
-        sx={{ p: { xs: 2, sm: 3 }, mb: 3 }}
+      <Panel
+        id="recovery-panel"
+        icon={<BuildOutlined fontSize="small" />}
+        title="管理员手动补单"
+        hint="支持只生成补单链接，或确认后使用已保存的付款卡付款。服务器逐笔处理，间隔至少 30 秒。"
+        sx={{ mb: 3 }}
       >
         <Stack
-          direction={{ xs: "column", sm: "row" }}
-          justifyContent="space-between"
-          spacing={2}
+          direction="row"
+          spacing={1}
+          alignItems="center"
+          sx={{ flexWrap: "wrap", rowGap: 1 }}
         >
-          <Box>
-            <Typography id="recovery-panel-title" variant="h2" sx={{ fontSize: 21 }}>
-              管理员手动补单
-            </Typography>
-            <Typography color="text.secondary" variant="body2" sx={{ mt: 1 }}>
-              支持只生成补单链接，或确认后使用已保存的付款卡付款。服务器逐笔处理，间隔至少
-              30 秒。
-            </Typography>
-          </Box>
-          <Stack
-            direction="row"
-            spacing={1}
-            alignItems="center"
-            sx={{ flexWrap: "wrap", rowGap: 1 }}
-          >
             <Button
               variant="outlined"
               disabled={busy || active}
@@ -402,7 +390,6 @@ export function RecoveryPanel({
               </Button>
             )}
           </Stack>
-        </Stack>
         {paused && (
           <Alert severity="warning" sx={{ mt: 2 }}>
             付款保护已触发：用户充值与付款卡付款均已暂停。启动补单时，需在确认框中勾选解除暂停。
@@ -552,7 +539,7 @@ export function RecoveryPanel({
             </Button>
           </DialogActions>
         </Dialog>
-      </Paper>
+      </Panel>
     </>
   );
 }
