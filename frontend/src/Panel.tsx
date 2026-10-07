@@ -121,3 +121,67 @@ export function SubHeading({ children, id }: { children: ReactNode; id?: string 
     </Typography>
   );
 }
+
+/**
+ * 空状态：面板还没有结果时占位，给出下一步该做什么。
+ *
+ * 之前短页面（如「查询」）下方是整片空白，看不出是"还没查"还是"加载中"；
+ * 有了这个占位，未查询与无结果两种情形都能被明确表达。
+ */
+export function EmptyState({
+  icon,
+  title,
+  hint,
+  action,
+}: {
+  icon?: ReactNode;
+  title: string;
+  hint?: ReactNode;
+  action?: ReactNode;
+}) {
+  return (
+    <Stack
+      alignItems="center"
+      spacing={1.25}
+      // role=status 让筛选结果"从无到有"的切换能被读屏播报
+      role="status"
+      sx={{
+        py: { xs: 3, sm: 4 },
+        px: 2,
+        textAlign: "center",
+        border: 1,
+        borderStyle: "dashed",
+        borderColor: "divider",
+        borderRadius: 2,
+        bgcolor: "action.hover",
+      }}
+    >
+      {icon && (
+        <Box
+          aria-hidden="true"
+          sx={{
+            width: 40,
+            height: 40,
+            borderRadius: "50%",
+            display: "grid",
+            placeItems: "center",
+            color: "text.secondary",
+            bgcolor: "background.paper",
+            border: 1,
+            borderColor: "divider",
+            "& svg": { fontSize: 20 },
+          }}
+        >
+          {icon}
+        </Box>
+      )}
+      <Typography sx={{ fontWeight: 650, fontSize: 14 }}>{title}</Typography>
+      {hint && (
+        <Typography variant="body2" color="text.secondary" sx={{ maxWidth: 460 }}>
+          {hint}
+        </Typography>
+      )}
+      {action}
+    </Stack>
+  );
+}

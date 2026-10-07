@@ -14,7 +14,7 @@ import {
 import { adminApi } from "./adminApi";
 import { codeStatus } from "./codeStatus";
 import PersonSearchRounded from "@mui/icons-material/PersonSearchRounded";
-import { Panel } from "./Panel";
+import { EmptyState, Panel } from "./Panel";
 
 type Detail = {
   order: {
@@ -131,6 +131,13 @@ export function CustomerPanel({
               查询客户订单
             </Button>
           </Stack>
+        </Box>
+        <Box sx={{ mt: 2 }}>
+          <EmptyState
+            icon={<PersonSearchRounded fontSize="small" />}
+            title="还没有查询记录"
+            hint="输入客户的 X 用户名，即可一次看到该客户的全部兑换码、付款链接与当前状态。"
+          />
         </Box>
       </Panel>
       <Dialog

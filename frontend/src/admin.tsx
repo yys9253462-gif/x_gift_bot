@@ -882,17 +882,20 @@ function Admin() {
                     </Typography>
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
-                    <Stack direction="row" spacing={1}>
+                    {/* 操作列保持单行：按钮文案压到最短，文案含义靠 aria-label 补全，
+                        否则窄屏下这一列会把整表撑到 800px 并让文字换行成三行。 */}
+                    <Stack direction="row" spacing={0.75} sx={{ flexWrap: "nowrap" }}>
                       <Button
                         size="small"
                         variant="outlined"
                         disabled={busy || loading}
+                        aria-label={`查看尾号 ${code.hint} 的兑换码并补单`}
                         onClick={() =>
                           setCustomerSelection({ id: code.id, seq: Date.now() })
                         }
                         sx={{ whiteSpace: "nowrap", flexShrink: 0 }}
                       >
-                        查看兑换码 / 补单
+                        补单
                       </Button>
                       <Tooltip
                         describeChild
@@ -912,8 +915,8 @@ function Admin() {
                             sx={{
                               border: 1,
                               borderColor: "divider",
-                              width: 44,
-                              height: 44,
+                              width: 40,
+                              height: 40,
                             }}
                           >
                             <ContentCopyOutlined fontSize="small" />
@@ -933,8 +936,8 @@ function Admin() {
                               sx={{
                                 border: 1,
                                 borderColor: "divider",
-                                width: 44,
-                                height: 44,
+                                width: 40,
+                                height: 40,
                               }}
                             >
                               <BlockOutlined fontSize="small" />

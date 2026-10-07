@@ -97,6 +97,17 @@ export function mount(node: ReactNode) {
   );
 }
 
+// 页脚裸文本链接的最小触达尺寸（WCAG 2.5.8 为 24×24 CSS px）。
+// 用负 margin 撑开点击区域而不改变视觉行距，避免撑高页脚。
+const linkHit = {
+  display: "inline-flex",
+  alignItems: "center",
+  minHeight: 24,
+  minWidth: 24,
+  py: 0.25,
+  mx: -0.25,
+} as const;
+
 export function Shell({
   admin = false,
   maxWidth,
@@ -175,6 +186,8 @@ export function Shell({
           href="https://github.com/yys9253462-gif/x_gift_bot/blob/main/LICENSE"
           target="_blank"
           rel="noopener noreferrer"
+          // WCAG 2.5.8 要求触达目标不小于 24×24 CSS px，裸文本链接默认不足。
+          sx={linkHit}
         >
           MIT License
         </Link>
@@ -188,7 +201,7 @@ export function Shell({
           href="https://github.com/yys9253462-gif/x_gift_bot"
           target="_blank"
           rel="noopener noreferrer"
-          sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}
+          sx={{ ...linkHit, display: "inline-flex", alignItems: "center", gap: 0.5 }}
         >
           <GitHubIcon sx={{ fontSize: 16 }} aria-hidden="true" />
           GitHub

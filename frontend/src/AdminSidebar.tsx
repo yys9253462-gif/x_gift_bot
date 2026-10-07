@@ -75,7 +75,11 @@ export function AdminSidebar({
         flexShrink: 0,
         position: "sticky",
         top: 16,
-        alignSelf: "flex-start",
+        // 用 stretch + minHeight 让侧栏与内容区等高：之前 alignSelf:flex-start
+        // 让它按内容收缩，短页面（如查询页）下方会留出一大块空白。
+        // maxHeight 保留，导航项变多时仍可内部滚动而不顶出视口。
+        alignSelf: "stretch",
+        minHeight: { xs: "auto", md: `calc(100vh - 32px)` },
         maxHeight: "calc(100vh - 32px)",
         overflowY: "auto",
         overflowX: "hidden",

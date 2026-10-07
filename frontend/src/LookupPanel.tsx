@@ -10,7 +10,7 @@ import {
   Typography,
 } from "@mui/material";
 import ManageSearchRounded from "@mui/icons-material/ManageSearchRounded";
-import { Panel } from "./Panel";
+import { EmptyState, Panel } from "./Panel";
 import { adminApi, formatTime, type AdminCode } from "./adminApi";
 import { codeStatus } from "./codeStatus";
 
@@ -152,6 +152,15 @@ export function LookupPanel({
         </Alert>
       )}
       <Box aria-live="polite">
+        {!result && !error && (
+          <Box sx={{ mt: 2 }}>
+            <EmptyState
+              icon={<ManageSearchRounded fontSize="small" />}
+              title="还没有查询记录"
+              hint="在上方粘贴客户提供的完整兑换码（XG- 开头），即可看到状态、批次与接收账号，无需翻页查找。"
+            />
+          </Box>
+        )}
         {result && (
           <Box
             sx={{
