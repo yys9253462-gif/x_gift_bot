@@ -547,6 +547,7 @@ func (c *xClient) identity(ctx context.Context, user string, requireEligible boo
 	}
 	return u.ID, nil
 }
+
 // QuoteResult is what X actually returned for a product, in the region implied
 // by the current payment exit. It exists so an operator can see the real price
 // instead of only "matches / does not match".

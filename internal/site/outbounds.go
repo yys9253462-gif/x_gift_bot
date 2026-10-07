@@ -30,14 +30,14 @@ type outboundNodeForm struct {
 	Port     string `json:"server_port"`        // kept as text so an empty box is detectable
 	Username string `json:"username,omitempty"` // http / socks5
 	Password string `json:"password,omitempty"`
-	Method   string `json:"method,omitempty"` // shadowsocks cipher
-	UUID     string `json:"uuid,omitempty"`   // vmess / vless / trojan(password) / anytls(password)
+	Method   string `json:"method,omitempty"`   // shadowsocks cipher
+	UUID     string `json:"uuid,omitempty"`     // vmess / vless / trojan(password) / anytls(password)
 	Security string `json:"security,omitempty"` // vless tls/reality
 	SNI      string `json:"sni,omitempty"`
-	Flow     string `json:"flow,omitempty"`      // vless flow
-	Raw      string `json:"raw,omitempty"`       // per-node raw JSON escape hatch
-	TLS      bool   `json:"tls,omitempty"`       // trojan / http-with-tls
-	Network  string `json:"network,omitempty"`   // vless ws/grpc
+	Flow     string `json:"flow,omitempty"`    // vless flow
+	Raw      string `json:"raw,omitempty"`     // per-node raw JSON escape hatch
+	TLS      bool   `json:"tls,omitempty"`     // trojan / http-with-tls
+	Network  string `json:"network,omitempty"` // vless ws/grpc
 	WSPath   string `json:"ws_path,omitempty"`
 }
 
@@ -47,10 +47,10 @@ type outboundsForm struct {
 }
 
 var (
-	outboundTagPattern   = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
-	outboundHostPattern  = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,255}$`)
-	outboundUUIDPattern  = regexp.MustCompile(`^[0-9a-fA-F-]{8,64}$`)
-	outboundCipherOK     = map[string]bool{
+	outboundTagPattern  = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
+	outboundHostPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,255}$`)
+	outboundUUIDPattern = regexp.MustCompile(`^[0-9a-fA-F-]{8,64}$`)
+	outboundCipherOK    = map[string]bool{
 		"aes-128-gcm": true, "aes-192-gcm": true, "aes-256-gcm": true,
 		"aes-128-cfb": true, "aes-192-cfb": true, "aes-256-cfb": true,
 		"chacha20-ietf-poly1305": true, "xchacha20-ietf-poly1305": true,
@@ -239,8 +239,8 @@ func (f *outboundsForm) outboundsRecord() ([]byte, error) {
 // credentials. It also reports the payment path's own view so the operator sees
 // whether the checkout would currently run direct or through the pool.
 type outboundSummary struct {
-	Configured bool     `json:"configured"`
-	Nodes      int      `json:"nodes"`
+	Configured bool `json:"configured"`
+	Nodes      int  `json:"nodes"`
 	// 初始化为空切片，保证序列化成 [] 而不是 null —— 前端会直接读 .length。
 	Tags      []string `json:"tags"`
 	Mode      string   `json:"mode"`      // direct | pool
