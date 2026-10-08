@@ -395,6 +395,18 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 		}()
 	}
 	if mutation && !probe {
+		// 固定前缀 + PutDiagnostic 裁剪，与上面的 read-failure 一致。
+		// 这一类比 read-failure 更该有上限：它保存完整的付款证据
+		// （session、payment_method、submitted_at），而创建重试是有预算的
+		// 循环，凭据或网络异常时会连续写很多条，长期堆积既占空间也
+		// 让人翻不到真正相关的那次。
+		// 时间戳保留在 audit.StartedAt / FinishedAt 内部。
+		//
+		// 两次 persist 必须写同一条记录：调用审计是为了在响应丢失时
+		// 能看出"这次创建尝试发出去了没有、结果是什么"。若每次写新key，
+		// 就会变成"发出去了"和"结果是什么"两条独立记录，读者得自己
+		// 按时间拼，而崩溃时就只剩其中一半 —— 恰好丢掉了最关键的那一半。
+		// 所以这里先建好key，再用 Put 覆盖更新。
 		key := fmt.Sprintf("x-create-attempt:%s:%d", user, time.Now().UnixNano())
 		persist := func() error {
 			b, e := json.Marshal(audit)
@@ -415,6 +427,11 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 			if e := persist(); e != nil {
 				callErr = errors.New("could not preserve X creation outcome; automatic recovery blocked")
 			}
+			// 一次尝试完成后再裁剪：这个前缀下每次下单各一条，
+			// 保留最近的即可 —— 更早的付款证据在 checkout 记录里。
+			// 裁剪失败不能改写 callErr：审计已经落库，删多余的旧记录
+			// 是 housekeeping，不是这次尝试成败的一部分。
+			_ = c.vault.TrimDiagnostics(fmt.Sprintf("x-create-attempt:%s", user))
 		}()
 	}
 	target := "https://x.com/i/api/graphql/" + id + "/" + name

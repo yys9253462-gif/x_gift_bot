@@ -119,3 +119,32 @@ func TestLikePrefixEscapesWildcards(t *testing.T) {
 		t.Fatalf("通配符未转义：得到 %q，应为 %q", got, want)
 	}
 }
+
+// TrimDiagnostics 用于"同一条记录原地更新"的场景：写入本身不能裁剪，
+// 必须在事件结束后单独调一次。
+func TestTrimDiagnosticsKeepsFixedKeyUpdates(t *testing.T) {
+	v := testVault(t)
+	const prefix = "x-create-attempt:user"
+	// 模拟 60 次下单，每次写一条（模拟一次尝试内的两次 persist 已合并）。
+	for i := 0; i < 60; i++ {
+		key := fmt.Sprintf("%s:%d", prefix, i)
+		if err := v.Put(key, []byte(fmt.Sprintf("attempt %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := v.TrimDiagnostics(prefix); err != nil {
+		t.Fatalf("裁剪失败：%v", err)
+	}
+	n, _ := v.CountDiagnostics(prefix)
+	if n != diagnosticKeepPerPrefix {
+		t.Fatalf("裁剪后应剩 %d 条，实际 %d", diagnosticKeepPerPrefix, n)
+	}
+	// 最后写入的必须还在。
+	if _, err := v.Get(fmt.Sprintf("%s:%d", prefix, 59)); err != nil {
+		t.Fatalf("最新一条被裁掉了：%v", err)
+	}
+	// 最早那条应已被裁。
+	if _, err := v.Get(fmt.Sprintf("%s:%d", prefix, 0)); err == nil {
+		t.Fatal("最旧的记录未被裁掉")
+	}
+}

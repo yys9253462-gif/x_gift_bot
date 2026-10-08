@@ -84,3 +84,23 @@ func likePrefix(prefix string) string {
 func DiagnosticPrefix(kind, subject string) string {
 	return kind + ":" + subject + ":" + fmt.Sprintf("%d", time.Now().UnixNano())
 }
+
+// TrimDiagnostics deletes everything beyond the newest
+// diagnosticKeepPerPrefix records under prefix.
+//
+// Used where a single logical event updates one fixed key in place (the
+// creation audit records "attempt sent" and then "outcome"), so the write
+// itself cannot trim: both writes must land on the same row. Trimming has to
+// happen once at the end instead.
+func (v *Vault) TrimDiagnostics(prefix string) error {
+	_, err := v.db.Exec(
+		`DELETE FROM secrets WHERE rowid IN (
+			SELECT rowid FROM secrets
+			 WHERE name LIKE ? ESCAPE '!'
+			 ORDER BY rowid DESC
+			 LIMIT -1 OFFSET ?
+		 )`,
+		likePrefix(prefix), diagnosticKeepPerPrefix,
+	)
+	return err
+}
