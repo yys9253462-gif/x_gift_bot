@@ -21,8 +21,10 @@ const now = Math.floor(Date.now() / 1000);
 const giftDemoState = [];
 function giftDemoTask(username, months) {
   const t = now;
+  const id = "gift-demo" + Math.random().toString(16).slice(2, 10);
   return {
-    task_id: "gift-demo" + Math.random().toString(16).slice(2, 10),
+    id,
+    task_id: id,
     username,
     months,
     state: "failed",

@@ -495,8 +495,9 @@ func (s *server) middleware(next http.Handler) http.Handler {
 				max = 8
 				bucket = "check:"
 			} else if r.URL.Path == "/api/admin/gift" {
-				// 立即赠送会真的提交付款，因此单独限流：正常后台使用
-				// 一小时也发不了几单，误触或重复点击才是这里要挡的。
+				// 立即赠送会真的提交付款，因此单独限流。
+				// 窗口是 1 分钟（见 allow()），20 次/分钟足够正常后台使用，
+				// 真正的风险是误触或脚本重复提交，那才是这里要挡的。
 				max = 20
 				bucket = "admin-gift:"
 			}

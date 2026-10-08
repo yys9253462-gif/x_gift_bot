@@ -374,7 +374,11 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 			}
 			b, err := json.Marshal(audit)
 			defer clear(b)
-			if err != nil || c.vault.Put(fmt.Sprintf("x-read-failure:%s:%s:%d", user, name, time.Now().UnixNano()), b) != nil {
+			// 固定前缀 + PutDiagnostic 自行裁剪：原来的 key 里带纳秒后缀，
+			// 每次失败都新增一行且永不清理。凭据失效时重试循环每秒能写几条，
+			// 几个月后 vault 就会涨到诊断时一次性全量加载。
+			// 时间戳保留在 audit 结构内部，排查时看 StartedAt 即可。
+			if err != nil || c.vault.PutDiagnostic(fmt.Sprintf("x-read-failure:%s:%s", user, name), b) != nil {
 				callErr = fmt.Errorf("%w: could not preserve failure details", ErrXReadFailure)
 				return
 			}

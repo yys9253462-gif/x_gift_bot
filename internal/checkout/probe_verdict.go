@@ -55,6 +55,17 @@ type ProbeVerdict struct {
 
 // ProbeGiftEligibility 向 X 询问"能否为该接收方创建订单"。
 //
+// 它确实会在 X 侧创建一个 unpaid 会话（X 没有"只校验不建单"的接口）。
+// 后果与安全性：
+//   - 该会话是 unpaid，永不提交付款，所以不会扣款。
+//   - X 侧会看到两个会话（探测的 + 正式下单的），但只有后者被选中付款。
+//     这与 checkout.go 自己的行为一致：那里也承认"A lost response can
+//     leave an unused external session, but only the selected saved
+//     session is paid"。
+//   - 探测的会话不落vault，所以服务重启后不留审计线索。这是刻意的：
+//     把它记成 checkout 记录会被后续流程当成"已有订单"而复用，
+//     那才是危险的。
+//
 // port 为 0 表示由调用方决定是否启动区域出口；探测必须走区域出口，
 // 否则 X 会按服务器所在地定价与判权限，与真实下单不一致。
 func ProbeGiftEligibility(ctx context.Context, v *vault.Vault, user string, port, months int) (ProbeVerdict, error) {

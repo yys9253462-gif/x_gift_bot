@@ -50,6 +50,7 @@ type Diagnosis = {
 };
 
 type Task = {
+  id: string;
   username: string;
   recipient?: string;
   months: number;
@@ -121,18 +122,33 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
       .catch(() => setError("无法读取套餐配置。"));
   }, [loadTasks]);
 
-  // 轮询只在有任务未结束时运行，避免空转。
+  // 轮询目标：优先跟随 current（刚发起的那个），否则跟随列表里第一个
+  // 未完成的任务。
+  //
+  // 第一版只认 current。切换到别的页面再回来时组件重新挂载、current 归零，
+  // 正在跑的任务就失去了轮询 —— 界面停在旧状态，而按钮已经恢复可用，
+  // 运营完全看不到刚才那单怎么了。所以要从任务列表里把未完成的捞回来。
+  const pendingId =
+    current || tasks.find((t) => t.state === "queued" || t.state === "running")?.id || "";
+
   useEffect(() => {
-    if (!current) return;
+    if (!pendingId) {
+      // 没有待办任务时，若按钮仍处于忙碌态说明状态丢了，解开它。
+      setBusy((b) => (b ? false : b));
+      return;
+    }
+    let stopped = false;
     const tick = async () => {
       try {
-        const t = await adminApi<Task>(`/api/admin/gift/${current}`);
-        setTasks((prev) => [t, ...prev.filter((x) => x.username + x.created !== t.username + t.created)]);
+        const t = await adminApi<Task>(`/api/admin/gift/${pendingId}`);
+        if (stopped) return;
+        setTasks((prev) => [t, ...prev.filter((x) => x.id !== t.id)]);
         if (t.state === "succeeded" || t.state === "failed") {
           setCurrent("");
           setBusy(false);
         }
       } catch (e) {
+        if (stopped) return;
         setError(e instanceof Error ? e.message : "读取任务状态失败。");
         setCurrent("");
         setBusy(false);
@@ -141,10 +157,11 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
     void tick();
     pollRef.current = window.setInterval(() => void tick(), 2000);
     return () => {
+      stopped = true;
       if (pollRef.current) window.clearInterval(pollRef.current);
       pollRef.current = null;
     };
-  }, [current]);
+  }, [pendingId]);
 
   const start = async () => {
     const name = username.trim().replace(/^@/, "");

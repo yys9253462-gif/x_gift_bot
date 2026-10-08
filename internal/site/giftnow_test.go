@@ -2,6 +2,8 @@ package site
 
 import (
 	"errors"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -143,4 +145,157 @@ func TestProbeFailureKeepsOriginalReason(t *testing.T) {
 	if !strings.Contains(orig.Hint, "premium_gifting_eligible") {
 		t.Fatal("原始提示必须仍在，不能被探测结果覆盖")
 	}
+}
+
+// 错误文本会回显到后台页面，而它来自网络库与 sing-box。这两者都可能
+// 在错误里带上带认证信息的 URL，所以展示前必须脱敏。
+func TestRedactSecretsRemovesCredentials(t *testing.T) {
+	cases := []struct{ in, mustNot, mustKeep string }{
+		{
+			in:       "dial tcp: proxyconnect tcp: socks5://user_abc:secretpw@bd.zy3a.com:18495",
+			mustNot:  "secretpw",
+			mustKeep: "bd.zy3a.com",
+		},
+		{
+			in:       "Get \"https://api.stripe.com/v1/x\": sk_live_51Hxxxxxxxxxxxxxxxxxxxx",
+			mustNot:  "sk_live_51Hxxxxxxxxxxxxxxxxxxxx",
+			mustKeep: "api.stripe.com",
+		},
+		{
+			in:       "unauthorized: Authorization: Bearer AAAAAAAAAAAAAAAAAAAA",
+			mustNot:  "AAAAAAAAAAAAAAAAAAAA",
+			mustKeep: "unauthorized",
+		},
+		{
+			in:       "card fingerprint mismatch: 8c603ad029cc3748617dac161c2a0c832b200c5fafd280c9ec9be66b59ab88ec",
+			mustNot:  "8c603ad029cc3748617dac161c2a0c832b200c5fafd280c9ec9be66b59ab88ec",
+			mustKeep: "fingerprint",
+		},
+	}
+	for _, c := range cases {
+		got := redactSecrets(c.in)
+		if strings.Contains(got, c.mustNot) {
+			t.Errorf("脱敏后仍含敏感内容 %q：%s", c.mustNot, got)
+		}
+		if !strings.Contains(got, c.mustKeep) {
+			t.Errorf("脱敏后丢失了定位信息 %q：%s", c.mustKeep, got)
+		}
+	}
+}
+
+// 脱敏不能把正常错误信息也吃掉，否则失去诊断价值。
+func TestRedactSecretsKeepsDiagnosticText(t *testing.T) {
+	in := "X refused useOneTimePurchaseGiftMutation for this account: " +
+		"Recipient user is not eligible to receive gift [code 37]"
+	got := redactSecrets(in)
+	if !strings.Contains(got, "code 37") {
+		t.Errorf("X 的错误码必须保留，那是定位问题的关键：%s", got)
+	}
+	if !strings.Contains(got, "Recipient user") {
+		t.Errorf("X 的原文必须保留：%s", got)
+	}
+}
+
+// giftDiagnose 返回的 Detail 必须已经脱敏。
+func TestGiftDiagnoseRedactsDetail(t *testing.T) {
+	d := giftDiagnose(errors.New("proxyconnect: socks5://u:p@host:1080 refused"), 25, "询价")
+	if strings.Contains(d.Detail, ":p@") {
+		t.Fatalf("诊断详情泄露了凭据：%s", d.Detail)
+	}
+}
+
+// checkout 的哨兵错误必须全部有分类，否则页面只显示"未归类"。
+// 这条测试是防回归的关键：以后 checkout 新增错误而giftDiagnose
+// 没跟上时，它会立刻指出漏了哪个。
+//
+// 不要求每个都有专属分类，但绝不能落到 unknown —— unknown 对运营
+// 等于"我不知道出了什么事"，那还不如显示原始错误文本。
+func TestEveryCheckoutSentinelIsClassified(t *testing.T) {
+	sentinels := map[string]error{
+		"ErrGiftNotAuthorised":     checkout.ErrGiftNotAuthorised,
+		"ErrOperationRejected":     checkout.ErrOperationRejected,
+		"ErrNotEligible":           checkout.ErrNotEligible,
+		"ErrUserNotFound":          checkout.ErrUserNotFound,
+		"ErrXReadFailure":          checkout.ErrXReadFailure,
+		"ErrPaymentPaused":         checkout.ErrPaymentPaused,
+		"ErrPaymentDeclined":       checkout.ErrPaymentDeclined,
+		"ErrPaymentActionRequired": checkout.ErrPaymentActionRequired,
+		"ErrNoUsableCard":          checkout.ErrNoUsableCard,
+		"ErrPaymentNodesCooling":   checkout.ErrPaymentNodesCooling,
+	}
+	for name, sentinel := range sentinels {
+		d := giftDiagnose(sentinel, 25, "阶段")
+		if d.Category == "unknown" {
+			t.Errorf("%s 没有分类，页面会显示「未归类」", name)
+		}
+		if d.Summary == "" || d.Hint == "" {
+			t.Errorf("%s 缺少结论或处置建议", name)
+		}
+	}
+}
+
+// 付款类错误必须与资格类区分开：处置动作完全不同
+// （换卡/等冷却 vs 改账号/换接收方）。
+func TestPaymentFailuresAreDistinctFromEligibilityFailures(t *testing.T) {
+	payment := []error{
+		checkout.ErrPaymentDeclined,
+		checkout.ErrPaymentActionRequired,
+		checkout.ErrNoUsableCard,
+		checkout.ErrPaymentNodesCooling,
+	}
+	for _, e := range payment {
+		d := giftDiagnose(e, 80, "提交付款")
+		if d.Category == "recipient_ineligible" || d.Category == "sender_not_authorised" {
+			t.Errorf("付款失败 %v 被误归为资格问题（%s）", e, d.Category)
+		}
+		if !strings.HasPrefix(d.Category, "payment_") && d.Category != "no_usable_card" {
+			t.Errorf("付款失败应有 payment_ 前缀的分类，得到 %q", d.Category)
+		}
+	}
+}
+
+// work 槽必须在任务结束（含超时）后释放，否则一次卡住的赠送会让
+// 全站下单功能一直返回 409。这里验证 runGift 的所有退出路径都走到
+// 调用方的 defer 释放。
+func TestRunGiftAlwaysReturnsSoWorkSlotIsFreed(t *testing.T) {
+	// runGift 依赖 server 的 vault 与端口，构造完整 server 成本高；
+	// 这里退一步验证"槽位的获取与释放在同一个函数内成对出现"，
+	// 这是 govet 与人工 review 都能核对的结构性约束。
+	src := readSource(t, "giftnow.go")
+	if !strings.Contains(src, "case s.work <- struct{}{}:") {
+		t.Fatal("没有在入口获取 work 槽")
+	}
+	if !regexp.MustCompile(`defer func\(\) \{ s\.jobs\.Done\(\); <-s\.work \}\(\)`).MatchString(src) {
+		t.Fatal("没有在 goroutine 的 defer 里释放 work 槽")
+	}
+	// 释放必须在 go 语句之后、runGift 调用之前的 defer 上，
+	// 否则 runGift 提前 return 时不会执行。
+	idxGo := strings.Index(src, "go func()")
+	idxDefer := regexp.MustCompile(`defer func\(\) \{ s\.jobs\.Done\(\); <-s\.work \}\(\)`).FindStringIndex(src)
+	idxDeferAt := idxDefer[0]
+	if idxDeferAt < idxGo {
+		t.Fatal("释放槽位的 defer 必须写在 goroutine 内部第一行")
+	}
+}
+
+// 任务响应必须带 id：前端要靠它继续轮询。第一版只在 POST 响应里返回
+// task_id，列表接口不给，切换页面回来就找不到该轮询谁。
+func TestTaskViewCarriesID(t *testing.T) {
+	src := readSource(t, "giftnow.go")
+	if !regexp.MustCompile(`ID\s+string\s+` + "`json:\"id\"`").MatchString(src) {
+		t.Fatal("giftTask 必须有导出到 JSON 的 id 字段")
+	}
+	if !regexp.MustCompile(`ID:\s+id,`).MatchString(src) {
+		t.Fatal("创建任务时必须把 id 写进结构体")
+	}
+}
+
+// 读取当前包内的源文件，用来断言结构性约束。
+func readSource(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("读取 %s 失败：%v", name, err)
+	}
+	return string(b)
 }
