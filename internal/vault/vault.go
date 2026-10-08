@@ -180,6 +180,22 @@ func (v *Vault) PutIfAbsent(name string, plain []byte) (bool, error) {
 }
 func (v *Vault) Close() error { return v.db.Close() }
 
+// Delete removes a record. It reports whether the record existed.
+//
+// Callers that need to distinguish "gone" from "never was" must check the
+// boolean: treating both as success hides typos in the key.
+func (v *Vault) Delete(name string) (bool, error) {
+	res, err := v.db.Exec("DELETE FROM secrets WHERE name = ?", name)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // Archive atomically preserves an authenticated record under a new name and removes
 // its active key, only if its contents still match the verified snapshot.
 func (v *Vault) Archive(name, archive string, expected, archived []byte) error {

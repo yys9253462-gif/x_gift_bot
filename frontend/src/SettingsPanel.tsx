@@ -1,11 +1,25 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Alert, Box, Button, Checkbox, Chip, FormControlLabel, MenuItem, Stack, TextField, Typography } from "@mui/material";
+import {
+  Alert,
+  Box,
+  Button,
+  Checkbox,
+  Chip,
+  CircularProgress,
+  Divider,
+  FormControlLabel,
+  MenuItem,
+  Stack,
+  TextField,
+  Typography,
+} from "@mui/material";
 import AddRounded from "@mui/icons-material/AddRounded";
 import CloudOutlined from "@mui/icons-material/CloudOutlined";
 import KeyOutlined from "@mui/icons-material/KeyOutlined";
 import CreditCardOutlined from "@mui/icons-material/CreditCardOutlined";
 import PaymentsOutlined from "@mui/icons-material/PaymentsOutlined";
 import SettingsEthernetOutlined from "@mui/icons-material/SettingsEthernetOutlined";
+import NetworkCheckRounded from "@mui/icons-material/NetworkCheckRounded";
 import { adminApi } from "./adminApi";
 import { Panel } from "./Panel";
 import { parseCookies } from "./cookies";
@@ -90,6 +104,32 @@ type OutboundNode = {
   network?: string;
   ws_path?: string;
   tls?: boolean;
+};
+
+// 已保存的出站节点。id 是内容指纹，不是 tag —— tag 可以重复，
+// 用 tag 匹配就可能测错/删错节点。
+type SavedNode = {
+  id: string;
+  tag: string;
+  type: string;
+  server?: string;
+  server_port?: number;
+  country?: string;
+  pinned: boolean;
+};
+
+// 出站测试结果。
+type ProbeResult = {
+  ok: boolean;
+  node: string;
+  type: string;
+  server?: string;
+  ip?: string;
+  reach_x: boolean;
+  x_status?: number;
+  elapsed_ms: number;
+  stage?: string;
+  message: string;
 };
 
 type OutboundStatus = {
@@ -207,12 +247,34 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
   const [rawJSON, setRawJSON] = useState("");
   const [useRaw, setUseRaw] = useState(false);
   const [outboundError, setOutboundError] = useState("");
+  // 已保存的节点清单与操作中状态
+  const [savedNodes, setSavedNodes] = useState<SavedNode[]>([]);
+  const [pinnedId, setPinnedId] = useState("");
+  const [probing, setProbing] = useState("");
+  const [probes, setProbes] = useState<Record<string, ProbeResult>>({});
 
   const loadOutbounds = useCallback(async () => {
     setOutboundError("");
     try {
       const data = await adminApi<OutboundStatus>("/api/admin/settings/outbounds");
       setOutbounds(data);
+    } catch (e) {
+      setOutboundError((e as Error).message);
+    }
+  }, []);
+
+  // 节点清单与"保存出站池"是两条独立的路径：
+  // 清单负责测试/指定/删除（都走各自的端点，立即生效），
+  // 保存负责新增与改参数（整池提交）。
+  // 混在一起会出现"我删了节点但刷新后还在"这种困惑。
+  const loadNodeList = useCallback(async () => {
+    setOutboundError("");
+    try {
+      const data = await adminApi<{ nodes: SavedNode[]; pinned: string }>(
+        "/api/admin/settings/outbounds/nodes",
+      );
+      setSavedNodes(data.nodes ?? []);
+      setPinnedId(data.pinned ?? "");
     } catch (e) {
       setOutboundError((e as Error).message);
     }
@@ -239,7 +301,8 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
   useEffect(() => {
     void load();
     void loadOutbounds();
-  }, [load, loadOutbounds]);
+    void loadNodeList();
+  }, [load, loadOutbounds, loadNodeList]);
 
   async function saveOutbounds() {
     if (submitting.current) return;
@@ -255,6 +318,85 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
       if (!useRaw) setNodes([]);
       setRawJSON("");
       await loadOutbounds();
+      await loadNodeList();
+    } catch (e) {
+      setOutboundError((e as Error).message);
+    } finally {
+      setBusy(false);
+      submitting.current = false;
+    }
+  }
+
+  // 测试一个节点。不写 vault、不动配置，只报告能不能用。
+  async function testNode(n: SavedNode) {
+    if (probing) return;
+    setProbing(n.id);
+    setOutboundError("");
+    setProbes((prev) => {
+      const next = { ...prev };
+      delete next[n.id];
+      return next;
+    });
+    try {
+      const r = await adminApi<ProbeResult>("/api/admin/settings/outbounds/probe", { id: n.id });
+      setProbes((prev) => ({ ...prev, [n.id]: r }));
+    } catch (e) {
+      setOutboundError((e as Error).message);
+    } finally {
+      setProbing("");
+    }
+  }
+
+  // 指定/取消指定。立即生效（下一笔付款就按这个节点）。
+  async function pinNode(id: string) {
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true);
+    setOutboundError("");
+    setNotice("");
+    try {
+      await adminApi("/api/admin/settings/outbounds/pin", { id });
+      await loadNodeList();
+      setNotice(id ? "已指定该节点，后续付款优先走它（若它进入冷却会自动改用其他节点）。" : "已恢复为轮转。");
+    } catch (e) {
+      setOutboundError((e as Error).message);
+    } finally {
+      setBusy(false);
+      submitting.current = false;
+    }
+  }
+
+  // 删除一个已保存的节点。危险操作，所以要确认。
+  async function deleteNode(n: SavedNode) {
+    if (submitting.current) return;
+    if (!window.confirm(
+      `删除节点「${n.tag || n.server || n.id}」？
+
+` +
+        `删除后下一笔付款不再使用它。若池子里已经没有其他可用节点，付款会直接失败。`,
+    )) {
+      return;
+    }
+    submitting.current = true;
+    setBusy(true);
+    setOutboundError("");
+    setNotice("");
+    try {
+      const r = await adminApi<{ removed: number; remaining: number }>(
+        "/api/admin/settings/outbounds/delete",
+        { id: n.id },
+      );
+      setProbes((prev) => {
+        const next = { ...prev };
+        delete next[n.id];
+        return next;
+      });
+      await Promise.all([loadNodeList(), loadOutbounds()]);
+      setNotice(
+        r.remaining === 0
+          ? "已删除最后一个节点。付款将走直连——X 会按服务器所在地定价，通常更贵。"
+          : `已删除该节点，池里还剩 ${r.remaining} 个。`,
+      );
     } catch (e) {
       setOutboundError((e as Error).message);
     } finally {
@@ -743,6 +885,122 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
               </Box>
             </>
           )}
+
+          {/* 已保存的节点清单。
+              放在"保存出站节点"按钮上方，因为这两件事要分清：
+              上方是**已经生效**的池子（测试/指定/删除都立刻起作用），
+              下方表单是**待保存**的编辑稿。顺序反过来会让人以为
+              "填完要保存"才是生效路径。 */}
+          <Box sx={{ border: 1, borderColor: "divider", borderRadius: 2, overflow: "hidden" }}>
+            <Stack
+              direction="row"
+              alignItems="center"
+              sx={{ px: 2, py: 1.25, bgcolor: "surfaceContainerLow" }}
+            >
+              <Typography variant="subtitle2">
+                已生效的节点（{savedNodes.length}）
+              </Typography>
+              <Box sx={{ flex: 1 }} />
+              <Typography variant="body2" color="text.secondary">
+                {pinnedId ? "已指定首选节点" : "按轮转选择"}
+              </Typography>
+            </Stack>
+
+            {savedNodes.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ px: 2, py: 2 }}>
+                当前没有节点，付款走直连 —— X 会按服务器所在地定价，通常比低价区贵。
+                用下面的表单添加，保存后立刻生效。
+              </Typography>
+            ) : (
+              <Stack divider={<Divider flexItem />}>
+                {savedNodes.map((n) => {
+                  const pr = probes[n.id];
+                  return (
+                    <Box key={n.id} sx={{ px: 2, py: 1.5 }}>
+                      <Stack
+                        direction={{ xs: "column", sm: "row" }}
+                        alignItems={{ sm: "center" }}
+                        spacing={1}
+                      >
+                        <Box sx={{ minWidth: 0, flex: 1 }}>
+                          <Stack direction="row" alignItems="center" spacing={1}>
+                            <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
+                              {n.tag || "(未命名)"}
+                            </Typography>
+                            <Chip size="small" label={n.type} />
+                            {n.pinned && (
+                              <Chip size="small" color="primary" label="首选" />
+                            )}
+                          </Stack>
+                          <Typography
+                            variant="body2"
+                            color="text.secondary"
+                            noWrap
+                            sx={{ mt: 0.25 }}
+                          >
+                            {n.server ? `${n.server}:${n.server_port ?? ""}` : "直连"}
+                            {n.country ? ` · 标注 ${n.country}` : ""}
+                          </Typography>
+                        </Box>
+
+                        <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+                          <Button
+                            size="small"
+                            variant="outlined"
+                            disabled={busy || Boolean(probing)}
+                            startIcon={
+                              probing === n.id ? (
+                                <CircularProgress size={14} aria-hidden="true" />
+                              ) : (
+                                <NetworkCheckRounded />
+                              )
+                            }
+                            onClick={() => void testNode(n)}
+                          >
+                            {probing === n.id ? "测试中" : "测试"}
+                          </Button>
+                          <Button
+                            size="small"
+                            variant={n.pinned ? "contained" : "outlined"}
+                            disabled={busy}
+                            onClick={() => void pinNode(n.pinned ? "" : n.id)}
+                          >
+                            {n.pinned ? "取消首选" : "设为首选"}
+                          </Button>
+                          <Button
+                            size="small"
+                            color="error"
+                            disabled={busy || Boolean(probing)}
+                            onClick={() => void deleteNode(n)}
+                          >
+                            删除
+                          </Button>
+                        </Stack>
+                      </Stack>
+
+                      {pr && (
+                        <Alert
+                          severity={pr.ok ? "success" : "error"}
+                          sx={{ mt: 1.5, py: 0.5 }}
+                          onClose={() =>
+                            setProbes((prev) => {
+                              const next = { ...prev };
+                              delete next[n.id];
+                              return next;
+                            })
+                          }
+                        >
+                          {pr.ok
+                            ? `出口可用，IP ${pr.ip}，${pr.reach_x ? `可达 x.com（HTTP ${pr.x_status}）` : "但无法确认可达 x.com"}，耗时 ${pr.elapsed_ms}ms`
+                            : `${pr.message}（${pr.elapsed_ms}ms）`}
+                        </Alert>
+                      )}
+                    </Box>
+                  );
+                })}
+              </Stack>
+            )}
+          </Box>
 
           <Box sx={{ display: "flex", gap: 1.5, flexWrap: "wrap" }}>
             <Button

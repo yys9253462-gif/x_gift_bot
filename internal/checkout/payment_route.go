@@ -56,6 +56,11 @@ func PaymentNetworkStatus(v *vault.Vault) (PaymentNetwork, error) {
 	return PaymentNetwork{Mode: mode, Nodes: len(nodes), Available: len(available), Cooling: len(nodes) - len(available)}, nil
 }
 
+// OutboundID exposes the content fingerprint so the settings UI can name
+// nodes with the same identity the checkout matches on. Reimplemented here it
+// would drift, and a pin that silently never matches is worse than no pin.
+func OutboundID(raw json.RawMessage) string { return outboundID(raw) }
+
 func outboundID(raw json.RawMessage) string {
 	// Decode/re-encode to ignore whitespace and object key ordering.
 	var node map[string]any
@@ -135,7 +140,10 @@ func selectPaymentRoute(v *vault.Vault, recipient string) (*paymentRoute, error)
 	if err != nil || len(nodes) == 0 {
 		return nil, err
 	}
-	node, err := chooseAvailablePaymentNode(v, nodes)
+	// 首次选路才考虑手动指定。冷却轮换那条路径（约 237 行）必须继续用
+	// 轮转 —— 换了是为了躲开冷却中的节点，若那里也读指定，就会立刻
+	// 换回同一个正在冷却的节点，变成死循环。
+	node, err := choosePinnedOrRotating(v, nodes)
 	if err != nil {
 		return nil, err
 	}

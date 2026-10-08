@@ -307,6 +307,10 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/admin/settings/proxy", s.admin(s.saveProxy))
 	mux.HandleFunc("GET /api/admin/settings/outbounds", s.admin(s.outboundsStatus))
 	mux.HandleFunc("POST /api/admin/settings/outbounds", s.admin(s.saveOutbounds))
+	mux.HandleFunc("GET /api/admin/settings/outbounds/nodes", s.admin(s.outboundsNodes))
+	mux.HandleFunc("POST /api/admin/settings/outbounds/probe", s.admin(s.probeOutboundNode))
+	mux.HandleFunc("POST /api/admin/settings/outbounds/delete", s.admin(s.deleteOutboundNode))
+	mux.HandleFunc("POST /api/admin/settings/outbounds/pin", s.admin(s.pinOutboundNode))
 	if bootstrap {
 		mux.HandleFunc("GET /setup", s.setupPage)
 		mux.HandleFunc("GET /setup.js", s.asset("setup.js", "application/javascript; charset=utf-8"))

@@ -287,6 +287,40 @@ createServer(async (req, res) => {
       });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/api/admin/settings/outbounds/nodes") {
+      json(200, {
+        nodes: [
+          {
+            id: "a1b2c3d4e5f6a7b8",
+            tag: "bd-dhaka-own",
+            type: "socks",
+            server: "bd.zy3a.com",
+            server_port: 18495,
+            country: "孟加拉国",
+            pinned: false,
+          },
+          {
+            id: "b2c3d4e5f6a7b8c9",
+            tag: "sg-singapore-01",
+            type: "hysteria2",
+            server: "sg.zy3a.com",
+            server_port: 443,
+            country: "新加坡",
+            pinned: true,
+          },
+          {
+            id: "c3d4e5f6a7b8c9d0",
+            tag: "de-frankfurt-02",
+            type: "trojan",
+            server: "de.zy3a.com",
+            server_port: 443,
+            pinned: false,
+          },
+        ],
+        pinned: "b2c3d4e5f6a7b8c9",
+      });
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/api/admin/settings/outbounds") {
       json(200, {
         configured: true,
@@ -379,6 +413,42 @@ createServer(async (req, res) => {
       }
     }
     const body = JSON.parse(raw);
+    if (req.method === "POST" && url.pathname === "/api/admin/settings/outbounds/probe") {
+      // 第一个节点可达，第二个超时，第三个配置有问题 ——
+      // 三种结果都要能在界面上看到，才知道这块UI 撑不撑得住。
+      const id = body.id;
+      if (id === "a1b2c3d4e5f6a7b8") {
+        json(200, {
+          ok: true, node: "bd-dhaka-own", type: "socks",
+          server: "bd.zy3a.com:18495", ip: "45.86.220.31",
+          reach_x: true, x_status: 200, elapsed_ms: 812,
+          message: "出口可用，出口 IP 45.86.220.31",
+        });
+      } else if (id === "c3d4e5f6a7b8c9d0") {
+        json(200, {
+          ok: false, node: "de-frankfurt-02", type: "trojan",
+          reach_x: false, elapsed_ms: 46,
+          stage: "config",
+          message: "配置不合法，写进 vault 会让下一笔订单失败：trojan 节点缺少 password",
+        });
+      } else {
+        json(200, {
+          ok: false, node: "sg-singapore-01", type: "hysteria2",
+          reach_x: false, elapsed_ms: 40012,
+          stage: "exit",
+          message: "出口不可用（节点认证失败或端口不通）：read: connection reset by peer",
+        });
+      }
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/admin/settings/outbounds/pin") {
+      json(200, { ok: true, pinned: body.id || "" });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/admin/settings/outbounds/delete") {
+      json(200, { ok: true, removed: 1, remaining: 2 });
+      return;
+    }
     if (["/api/admin/manual-link", "/api/manual-link"].includes(url.pathname)) {
       if (![3, 6].includes(body.months) || !/^[a-z0-9_]{1,15}$/.test(body.username || "")) {
         json(400, {message: "请填写正确用户名和套餐。"}); return;
