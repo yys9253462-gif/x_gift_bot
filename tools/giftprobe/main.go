@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -109,6 +110,17 @@ func main() {
 	defer res.Body.Close()
 	fmt.Printf("=== 目标账号: %s ===\nHTTP %d\n", user, res.StatusCode)
 
+	// X 判定不可接收时，理由不在我们请求的三个字段里，而在同一响应的其他字段
+	// （已订阅 / 封禁 / 地区限制 /  就是发送方本人）。先留原文再解析，
+	// 这样遇到 false 时能看到原始判据，不必再猜。
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "读取响应失败:", err)
+		os.Exit(1)
+	}
+	if os.Getenv("GIFTPROBE_RAW") != "" {
+		fmt.Printf("--- 原始响应 ---\n%s\n", raw)
+	}
 	var body struct {
 		Data struct {
 			User struct {
@@ -120,7 +132,7 @@ func main() {
 			} `json:"user"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		fmt.Fprintln(os.Stderr, "解析响应失败:", err)
 		os.Exit(1)
 	}
