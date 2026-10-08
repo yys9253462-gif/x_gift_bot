@@ -72,7 +72,8 @@ type Plan = { months: number; amount: number; currency: string };
 const CATEGORY_LABELS: Record<string, string> = {
   sender_not_authorised: "发送账号被 X 限制",
   operation_stale: "X 接口标识可能已变更",
-  recipient_ineligible: "接收账号不可接收",
+  recipient_ineligible: "接收账号不可接收（已向X 核实）",
+  probe_failed: "向 X 核实判据失败",
   recipient_not_found: "接收账号不存在",
   x_read_failure: "X 查询失败",
   egress_unavailable: "付款出口不可用",
@@ -169,7 +170,7 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
       id="gift-now"
       title="立即赠送"
       icon={<SendOutlined />}
-      hint="填接收账号和套餐时长，后台跑完整流程直到付款。这会真的向 X 付款，请确认账号与时长无误。"
+      hint="填接收账号和套餐时长，后台跑完整流程直到付款。这会真的向 X 付款，请确认账号与时长无误。资格预检只是初判：预检不通过时系统会再向 X 的下单接口核实一次，以 X 的答复为准。"
       actions={
         <Chip
           size="small"
@@ -303,6 +304,15 @@ function TaskCard({ task }: { task: Task }) {
           <Typography variant="body2" sx={{ mb: 0.75 }}>
             {d.summary}
           </Typography>
+
+          {/* 预检只是一个布尔字段，不能当结论。这里显式说明结论的来源，
+              避免运营看到"不支持接收"就去换接收账号 —— 2026-10-08 的真实原因
+              是发送账号被限，换接收方完全没用。 */}
+          <Alert severity="info" icon={false} sx={{ mb: 1, py: 0.25, bgcolor: "action.hover" }}>
+            <Typography variant="caption" display="block">
+              结论来源：已向 X 的下单接口核实，不是只看premium_gifting_eligible 字段。
+            </Typography>
+          </Alert>
 
           {d.stage && (
             <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.75 }}>

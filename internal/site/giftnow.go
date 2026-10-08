@@ -268,9 +268,59 @@ func (s *server) runGift(ctx context.Context, id string, task *giftTask, usernam
 		if len(task.Stages) > 0 {
 			stage = task.Stages[len(task.Stages)-1].Message
 		}
+		// Run 在 identity() 处就因为 premium_gifting_eligible=false 退出了，
+		// 而那只是一个布尔值，把"接收方不可接收""发送账号被限""接口变更"
+		// 压成了同一个false。2026-10-08 实测四个不同接收方都返回同一个
+		// code 37，真实原因是发送账号被限，但界面显示的是接收方不可接收 ——
+		// 运营会去换接收账号，而那完全没用。
+		//
+		// 所以这里不直接采信本地结论，先向 X 的下单接口核实一次。
+		if errors.Is(err, checkout.ErrNotEligible) {
+			tracker.advance(30, "资格预检未通过，正在向 X 核实真实原因…")
+			verdict, perr := checkout.ProbeGiftEligibility(ctx, s.vault, username, s.port, months)
+			switch {
+			case perr != nil:
+				// 探测本身失败不掩盖原始错误，两个原因都报出来。
+				d := giftDiagnose(err, task.Stage.Percent, stage)
+				d.Hint += fmt.Sprintf("（额外尝试向X 核实判据时也失败：%v）", perr)
+				giftFail(task, d, rec)
+			case !verdict.SenderAuthorised:
+				// 这才是今晚的真实原因：X 拒的是发送账号。
+				giftFail(task, &giftDiagnosis{
+					Category: "sender_not_authorised",
+					Summary:  "发送账号被 X 限制，无权赠送（不是接收方的问题）",
+					Detail: fmt.Sprintf("本地预检显示 premium_gifting_eligible=false；"+
+						"向 X 下单接口核实后得到：%s", verdict.Reason),
+					Hint:  verdict.Hint,
+					XCode: verdict.XCode, XMessage: verdict.XMessage,
+					Stage: stage,
+				}, rec)
+			default:
+				// X 其实接受了为该接收方建单：本地布尔值不可信，按X 的答复走。
+				giftUpdate(task, func(x *giftTask) {
+					x.Recipient = verdict.Recipient
+					st := giftStage{Percent: 35, Message: "资格预检与 X 实际判据不一致，已以 X 的答复为准继续下单…", At: time.Now().Unix()}
+					x.Stages = append(x.Stages, st)
+					x.Stage = st
+				})
+				rec, err = checkout.Run(ctx, s.vault, username, true, s.port, months)
+				if err == nil {
+					giftSucceed(task, rec, s)
+					return
+				}
+				stage = task.Stage.Message
+				giftFail(task, giftDiagnose(err, task.Stage.Percent, stage), rec)
+			}
+			return
+		}
 		giftFail(task, giftDiagnose(err, task.Stage.Percent, stage), rec)
 		return
 	}
+	giftSucceed(task, rec, s)
+}
+
+// giftSucceed 记录一次成功付款。
+func giftSucceed(task *giftTask, rec *checkout.Record, s *server) {
 	giftUpdate(task, func(t *giftTask) {
 		t.State = "succeeded"
 		t.Recipient = rec.RecipientID

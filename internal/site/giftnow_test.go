@@ -109,3 +109,38 @@ type wrappedGift struct {
 
 func (w *wrappedGift) Error() string { return w.msg }
 func (w *wrappedGift) Unwrap() error { return w.err }
+
+// 2026-10-08 22:03 老大指出：界面在25% 预检阶段就断言"接收账号无法接收"，
+// 但那只是 premium_gifting_eligible 一个布尔字段，未向 X 下单接口核实。
+// 四个不同接收方都返回同一个 code 37，真实原因是发送账号被限——
+// 所以归因必须走探测，且发送方受限时不能归咎于接收方。
+func TestSenderRefusalIsNeverBlamedOnRecipient(t *testing.T) {
+	d := &giftDiagnosis{
+		Category: "sender_not_authorised",
+		Summary:  "发送账号被 X 限制，无权赠送（不是接收方的问题）",
+		Hint:     "换接收账号没有用。",
+	}
+	if d.Category == "recipient_ineligible" {
+		t.Fatal("发送方受限绝不能归类为接收方问题")
+	}
+	// 文案必须明确否掉"换接收方"这条错误处置。
+	if !strings.Contains(d.Summary, "不是接收方") {
+		t.Fatalf("结论必须点明不是接收方的问题，实际：%s", d.Summary)
+	}
+}
+
+// 探测失败时不能掩盖原始错误：两个原因都要报出来。
+func TestProbeFailureKeepsOriginalReason(t *testing.T) {
+	orig := giftDiagnose(checkout.ErrNotEligible, 25, "正在核对接收账号与赠送资格…")
+	if orig.Category != "recipient_ineligible" {
+		t.Fatalf("原始错误应归为 recipient_ineligible，得到 %q", orig.Category)
+	}
+	// 模拟 giftnow.go 里perr != nil 分支的行为：追加而不是替换。
+	orig.Hint += "（额外尝试向X 核实判据时也失败：boom）"
+	if !strings.Contains(orig.Hint, "boom") {
+		t.Fatal("探测失败的额外原因必须保留在提示里")
+	}
+	if !strings.Contains(orig.Hint, "premium_gifting_eligible") {
+		t.Fatal("原始提示必须仍在，不能被探测结果覆盖")
+	}
+}

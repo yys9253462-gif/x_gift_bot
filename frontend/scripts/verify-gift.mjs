@@ -43,6 +43,9 @@ const checks = [
   "接收账号",
   "套餐时长",
   "/api/admin/gift",
+  "结论来源",
+  "向 X 的下单接口核实",
+  "不是只看premium_gifting_eligible",
 ];
 
 const bad = [];

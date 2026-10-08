@@ -185,6 +185,9 @@ type xClient struct {
 	ops          ResolvedOps
 	// closeRegional 释放为区域询价临时启动的付款出口（若启动过）。
 	closeRegional func()
+	// probe 为 true 时，本次创建只为向 X 询问判据：不写创建审计、
+	// 不占用任何重试预算，也不允许走到付款。探测失败不得影响真实下单。
+	probe bool
 }
 
 // withRegionalExit points the regional (pricing / checkout) calls at the
@@ -355,6 +358,11 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 		EdgeID      string `json:"edge_id,omitempty"`
 	}
 	audit.Operation, audit.Variables, audit.StartedAt, audit.Phase = name, variables, time.Now().Unix(), "request_pending"
+	// A probe writes no audit record on purpose: an operator asking X "why was
+	// this refused" must not consume the creation retry budget of the order
+	// they are trying to place. The budget exists to stop a real order from
+	// being recreated forever; a diagnostic never creates anything.
+	probe := c.probe
 	if !mutation {
 		defer func() {
 			if callErr == nil {
@@ -382,7 +390,7 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 			}
 		}()
 	}
-	if mutation {
+	if mutation && !probe {
 		key := fmt.Sprintf("x-create-attempt:%s:%d", user, time.Now().UnixNano())
 		persist := func() error {
 			b, e := json.Marshal(audit)
@@ -656,4 +664,19 @@ func (c *xClient) create(ctx context.Context, user, recipient string, p Plan) (s
 		return "", "", errors.New("X checkout URL is unsupported or does not match its session; payment was not submitted")
 	}
 	return s.ID, s.URL, nil
+}
+
+// createProbe 与 create 发出完全相同的请求，唯一区别是不写创建审计、
+// 不占用重试预算。它只用来向 X 询问判据，返回的会话一定是 Unpaid，
+// 调用方不得据此付款。
+//
+// 存在的理由：premium_gifting_eligible 只是一个布尔值，为 false 时生产链路
+// 在 identity() 处就返回 ErrNotEligible，运营看不到 X 的原始错误码。
+// 2026-10-08 因此误判过：四个不同接收方都返回 code 37，真实原因是发送账号
+// 被限，而界面却显示"该账号无法接收 Premium 赠送"。
+func (c *xClient) createProbe(ctx context.Context, user, recipient string, p Plan) (string, string, error) {
+	prev := c.probe
+	c.probe = true
+	defer func() { c.probe = prev }()
+	return c.create(ctx, user, recipient, p)
 }
