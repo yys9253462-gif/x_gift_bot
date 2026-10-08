@@ -40,17 +40,21 @@ type probeResult struct {
 }
 
 // probeOutbound 测一个节点。绝不写 vault、绝不调X 的写接口。
-func probeOutbound(ctx context.Context, node []byte) probeResult {
+// 结果用命名返回值，这样 defer 结算的耗时才会落到调用方真正收到的那份上。
+// 之前用 defer + 普通返回值，赋值发生在 reply(w, 200, res) 拷贝之后，
+// 界面永远显示 0ms（生产实测发现）。
+func probeOutbound(ctx context.Context, node []byte) (res probeResult) {
 	var meta struct {
 		Type, Tag, Server string
 		Port              uint16 `json:"server_port"`
 	}
 	_ = json.Unmarshal(node, &meta)
-	res := probeResult{
+	res = probeResult{
 		Node:   meta.Tag,
 		Type:   meta.Type,
 		Server: meta.Server,
 	}
+	// 命名返回值 + defer：赋值落在调用方真正收到的那个值上。
 	start := time.Now()
 	defer func() { res.ElapsedMs = time.Since(start).Milliseconds() }()
 
@@ -59,7 +63,7 @@ func probeOutbound(ctx context.Context, node []byte) probeResult {
 	if _, err := proxy.ParseOutboundPool([]byte("[" + string(node) + "]")); err != nil {
 		res.Stage = "config"
 		res.Message = "配置不合法，写进 vault 会让下一笔订单失败：" + err.Error()
-		return res
+		return
 	}
 	if meta.Type != "direct" {
 		res.Server = fmt.Sprintf("%s:%d", meta.Server, meta.Port)
@@ -71,7 +75,7 @@ func probeOutbound(ctx context.Context, node []byte) probeResult {
 	if err != nil {
 		res.Stage = "start"
 		res.Message = "无法启动该出站：" + err.Error()
-		return res
+		return
 	}
 	defer closeFn()
 
@@ -79,26 +83,26 @@ func probeOutbound(ctx context.Context, node []byte) probeResult {
 	if err != nil {
 		res.Stage = "build"
 		res.Message = "构建请求失败：" + err.Error()
-		return res
+		return
 	}
 	httpRes, err := client.Do(req)
 	if err != nil {
 		res.Stage = "exit"
 		res.Message = "出口不可用（节点认证失败或端口不通）：" + err.Error()
-		return res
+		return
 	}
 	defer httpRes.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(httpRes.Body, 4096))
 	if httpRes.StatusCode != 200 {
 		res.Stage = "exit"
 		res.Message = fmt.Sprintf("出口返回 HTTP %d", httpRes.StatusCode)
-		return res
+		return
 	}
 	var ip struct{ IP string }
 	if json.Unmarshal(raw, &ip) != nil || ip.IP == "" {
 		res.Stage = "exit"
 		res.Message = "无法解析出口 IP"
-		return res
+		return
 	}
 	res.IP = ip.IP
 
@@ -111,13 +115,13 @@ func probeOutbound(ctx context.Context, node []byte) probeResult {
 		} else {
 			res.Stage = "x"
 			res.Message = "出口能连通，但无法连接 x.com：" + e2.Error()
-			return res
+			return
 		}
 	}
 
 	res.OK = true
 	res.Message = "出口可用，出口 IP " + res.IP
-	return res
+	return
 }
 
 // outboundsDetail 返回给界面的节点清单。
