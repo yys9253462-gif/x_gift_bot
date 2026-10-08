@@ -80,6 +80,31 @@ export const theme = createTheme({
           bgcolor: "background.default",
           WebkitFontSmoothing: "antialiased",
         },
+        // 焦点可见性兜底。
+        //
+        // 2026-10-09 的键盘遍历发现 3 个元素聚焦后没有任何视觉变化
+        // （批次筛选里的套餐项，以及两个输入框）。逐个补 :focus-visible 规则
+        // 治标 —— 以后新增组件还会再漏。所以在这里给一个全局兜底：
+        // 任何可聚焦元素只要是"键盘焦点"就必然有轮廓。
+        //
+        // 用 :focus-visible 而不是 :focus —— 鼠标点击时不该冒出轮廓，
+        // 但键盘 Tab 时必须出现，这是 WCAG 2.4.7 的要求。
+        //
+        // 排除了 disabled：禁用元素不该显示焦点轮廓。
+        //
+        // 注意这条规则挂在 :root 上，所以子元素要靠 *:focus-visible 显式匹配
+        // —— 写 & :focus-visible（后代组合子）只对直接后代生效，
+        // 而真正需要的是任意深度（面板里的按钮、表格里的 Chip）。
+        // !important 是必要的：MUI 各组件自带 :focus-visible 规则且
+        // 注入在组件层，emotion 的注入顺序会让它们赢过这里的基线规则。
+        // 兜底规则必须能压过组件，否则等于没加。
+        "& *:focus-visible": {
+          outline: `2px solid ${theme.vars.palette.primary.main} !important`,
+          outlineOffset: "2px !important",
+          // MUI 的 ButtonBase 用 box-shadow 做 hover/focus 效果，
+          // 不清掉会与轮廓叠在一起，反而看不清焦点在哪。
+          "&:not([disabled])": { boxShadow: "none" },
+        },
         "*::-webkit-scrollbar": { width: 10, height: 10 },
         "*::-webkit-scrollbar-track": { background: "transparent" },
         "*::-webkit-scrollbar-thumb": {

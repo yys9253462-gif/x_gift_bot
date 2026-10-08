@@ -23,7 +23,7 @@ import { adminApi, formatTime } from "./adminApi";
 //   - 失败必须说清"哪里错"。这一页存在的理由就是 2026-10-08 那次：
 //     手动链接页把所有失败压成"该账号目前无法接收 Premium 赠送"，
 //     实际可能是发送账号被 X 限流（code 37）、X 接口改了、
-//     付款出口没配、套餐金额不匹配——完全不同的处置方式。
+//     付款出站没配、套餐金额不匹配——完全不同的处置方式。
 //     所以失败时直接展示分类、X 原始 code 与 message、以及该改什么。
 //   - 付款证据警告。如果订单已产生 session 或已提交，失败提示会额外
 //     提醒先核实 Stripe 是否已扣款，避免"看到失败就重试"造成重复扣款。
@@ -77,7 +77,9 @@ const CATEGORY_LABELS: Record<string, string> = {
   probe_failed: "向 X 核实判据失败",
   recipient_not_found: "接收账号不存在",
   x_read_failure: "X 查询失败",
-  egress_unavailable: "付款出口不可用",
+  // 侧栏那一项叫「付款出站」，正文就别叫「付款出口」——
+  // 用户记住的是侧栏上的字，提示里换词会让人以为是两个东西。
+  egress_unavailable: "付款出站不可用",
   price_mismatch: "价格不匹配",
   payment_paused: "付款已暂停",
   order_busy: "订单占用中",
@@ -99,13 +101,19 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
+  // 区分"还没加载"与"加载完但确实为空"：前者显示占位而不是
+  // "还没有赠送记录"，否则刚打开页面的人会以为真的没记录。
+  const [tasksLoaded, setTasksLoaded] = useState(false);
   const [current, setCurrent] = useState<string>("");
   const pollRef = useRef<number | null>(null);
+  // 提交守卫：同步生效，用来挡住连续点击。详见 start() 里的说明。
+  const submitting = useRef(false);
 
   const loadTasks = useCallback(async () => {
     try {
       const d = await adminApi<{ tasks: Task[] }>("/api/admin/gift/tasks");
       setTasks(d.tasks ?? []);
+      setTasksLoaded(true);
     } catch {
       // 列表刷新失败不打断当前任务，进度轮询自己会带出错误。
     }
@@ -169,6 +177,16 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
       setError("请填写接收账号。");
       return;
     }
+    // 🔴 提交守卫必须用 ref，不能只靠 busy 状态。
+    //
+    // setBusy(true) 是异步状态更新：React 要等本次事件处理完才重渲染。
+    // 连续点击时，5 次 click 都在同一轮事件里派发，每次都读到上一次的
+    // busy=false，于是全部进入 start() —— 实测发出 5 次 POST。
+    // 这在付款页是真实风险：可能下五单。
+    //
+    // ref 是同步的，click 处理完立即生效，后续点击直接被挡住。
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError("");
     try {
@@ -179,6 +197,10 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
     } catch (e) {
       setError(e instanceof Error ? e.message : "发起赠送失败。");
       setBusy(false);
+    } finally {
+      // 守卫在请求返回后释放：任务已受理，之后的"再点一次"是用户
+      // 明确想发起第二个任务，不该被上一次的守卫拦下。
+      submitting.current = false;
     }
   };
 
@@ -233,7 +255,13 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
         <Button
           type="submit"
           variant="contained"
-          disabled={busy || disabled || plans.length === 0}
+          disabled={
+            // 账号为空时也要禁用。第一版只看 busy/disabled/plans，
+            // 于是空账号也能点，点完在 onSubmit 里才提示
+            // "请填写接收账号" —— 白等一次往返，而且按钮可点的样子
+            // 让人以为能直接提交。
+            !username.trim() || busy || disabled || plans.length === 0
+          }
           startIcon={<SendOutlined />}
           sx={{ minWidth: 132 }}
         >
@@ -247,18 +275,26 @@ export function GiftNowPanel({ disabled = false }: { disabled?: boolean }) {
         </Alert>
       )}
 
-      {tasks.length > 0 && (
+      {tasks.length > 0 ? (
         <Box sx={{ mt: 3 }}>
           <Typography variant="h3" component="h3" sx={{ fontSize: 12, fontWeight: 650, color: "text.secondary", letterSpacing: ".06em", textTransform: "uppercase", mb: 1.25 }}>
             最近任务
           </Typography>
           <Stack spacing={1.5}>
             {tasks.slice(0, 8).map((t) => (
-              <TaskCard key={t.username + t.created + t.months} task={t} />
+              <TaskCard key={t.id} task={t} />
             ))}
           </Stack>
         </Box>
-      )}
+      ) : tasksLoaded ? (
+        // 空状态要说清"这里本该有东西"，否则首次使用的人会以为页面坏了。
+        // 但也要说清它不影响别的操作 —— 否则会让人以为必须先有历史。
+        <Box sx={{ mt: 3, p: 2, borderRadius: 2, border: "1px dashed", borderColor: "divider" }}>
+          <Typography variant="body2" color="text.secondary">
+            还没有赠送记录。上面填好接收账号与套餐即可发起，任务完成后会显示在这里，便于回头核对结果。
+          </Typography>
+        </Box>
+      ) : null}
     </Panel>
   );
 }

@@ -491,14 +491,14 @@ func giftDiagnose(err error, percent int, stage string) *giftDiagnosis {
 	// 这是 2026-10-08 整个事故的根因，所以单独一类。
 	case strings.Contains(err.Error(), "regional") || strings.Contains(err.Error(), "regional checkout proxy"):
 		d.Category = "egress_unavailable"
-		d.Summary = "付款出口不可用"
+		d.Summary = "付款出站不可用"
 		d.Detail = redactSecrets(err.Error())
-		d.Hint = "X 的下单与询价强制走 payment-outbounds（付款出口），直连会被判权限错误。检查后台「付款出站」是否已配置、节点是否可用、出口国家是否与预期一致。"
+		d.Hint = "X 的下单与询价强制走 payment-outbounds，直连会被判权限错误。检查后台「付款出站」是否已配置、节点是否可用、出口国家是否与预期一致。"
 	case strings.Contains(err.Error(), "price is not exactly") || strings.Contains(err.Error(), "amount"):
 		d.Category = "price_mismatch"
 		d.Summary = "X 返回的价格与配置不一致"
 		d.Detail = redactSecrets(err.Error())
-		d.Hint = "X 按请求出口所在国家定价。确认付款出口的国家，以及「商品与价格」里的金额与该国家 X 实际收取的金额一致。"
+		d.Hint = "X 按请求出口所在国家定价。确认付款出站所在的国家，以及「商品与价格」里的金额与该国家 X 实际收取的金额一致。"
 	case errors.Is(err, checkout.ErrPaymentPaused):
 		d.Category = "payment_paused"
 		d.Summary = "付款已被暂停"
@@ -528,10 +528,10 @@ func giftDiagnose(err error, percent int, stage string) *giftDiagnosis {
 			"与剩余冷却时间；被拒的卡必须先移出池子（会自动跳过）。"
 	case errors.Is(err, checkout.ErrPaymentNodesCooling):
 		d.Category = "payment_nodes_cooling"
-		d.Summary = "所有付款出口都在冷却中"
+		d.Summary = "所有付款出站都在冷却中"
 		d.Detail = redactSecrets(err.Error())
 		d.Hint = "出口连续失败会进入冷却以保护节点。等冷却结束，" +
-			"或在后台「付款出站」补一个可用出口。"
+			"或在后台「付款出站」补一个可用节点。"
 	default:
 		if d.XCode != 0 {
 			d.Category = "x_error"

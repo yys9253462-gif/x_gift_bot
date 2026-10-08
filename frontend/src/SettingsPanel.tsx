@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Box, Button, Checkbox, Chip, FormControlLabel, MenuItem, Stack, TextField, Typography } from "@mui/material";
 import AddRounded from "@mui/icons-material/AddRounded";
 import CloudOutlined from "@mui/icons-material/CloudOutlined";
@@ -140,6 +140,11 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 提交守卫：必须同步生效。setBusy(true) 要等 React 重渲染才可见，
+  // 而连续点击都在同一轮事件里派发，每次都读到旧的 busy=false。
+  // 这里保存的是配置（改价格、换凭据、存出站），重复提交虽不直接扣款，
+  // 但会写入 vault 并触发多余的服务重启。
+  const submitting = useRef(false);
 
   const [authToken, setAuthToken] = useState("");
   const [ct0, setCT0] = useState("");
@@ -237,6 +242,8 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
   }, [load, loadOutbounds]);
 
   async function saveOutbounds() {
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError("");
     setNotice("");
@@ -252,10 +259,13 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
       setOutboundError((e as Error).message);
     } finally {
       setBusy(false);
+      submitting.current = false;
     }
   }
 
   async function save(label: string, path: string, body: unknown) {
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError("");
     setNotice("");
@@ -269,6 +279,7 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
       setError((e as Error).message);
     } finally {
       setBusy(false);
+      submitting.current = false;
     }
   }
 
@@ -306,7 +317,10 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
         hint={`当前 auth_token：${view?.credentials.auth_token_tail || "未配置"}；ct0：${view?.credentials.has_ct0 ? "已配置" : "未配置"}。下面留空的字段保持原值不变。`}
       >
         <Stack spacing={2}>
-          {/* 换凭据时逐个抄太费劲，跟引导页一样支持整段粘贴自动拆分 */}
+          {/* 换凭据时逐个抄太费劲，跟引导页一样支持整段粘贴自动拆分。
+              界面上必须说清两件事，否则运营会在这三个动作之间犹豫：
+              ① 单字段是从上面粘贴自动带出来的，通常不用手填；
+              ② 留空 = 保持原值，不会把已有配置清掉。 */}
           <TextField
             label="粘贴整串 Cookie / JSON（自动填充下面的字段）"
             value={cookiePaste}
@@ -320,6 +334,7 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
             placeholder={
               'auth_token=abc123…; ct0=def456…\n或：[{"name":"auth_token","value":"abc…"},{"name":"ct0","value":"def…"}]'
             }
+            helperText="从浏览器开发者工具的 Application → Cookies 里复制整条 auth_token 与 ct0，或直接粘贴它们的 JSON。"
             slotProps={{ htmlInput: { spellCheck: false } }}
           />
           {pasteNote && (
@@ -327,11 +342,14 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
               {pasteNote}
             </Alert>
           )}
-          <TextField label="auth_token" value={authToken} onChange={(e) => setAuthToken(e.target.value)} autoComplete="off" disabled={busy} slotProps={{ htmlInput: { spellCheck: false } }} />
-          <TextField label="ct0" value={ct0} onChange={(e) => setCT0(e.target.value)} autoComplete="off" disabled={busy} slotProps={{ htmlInput: { spellCheck: false } }} />
+          <Typography variant="body2" color="text.secondary">
+            下面是自动拆出来的字段，也可以在下面直接改。留空保持原值不变。
+          </Typography>
+          <TextField label="auth_token" value={authToken} onChange={(e) => setAuthToken(e.target.value)} autoComplete="off" disabled={busy} helperText="X 登录后的 Bearer 令牌，是识别当前操作账号的依据。" slotProps={{ htmlInput: { spellCheck: false } }} />
+          <TextField label="ct0" value={ct0} onChange={(e) => setCT0(e.target.value)} autoComplete="off" disabled={busy} helperText="X 的 CSRF 令牌，与 auth_token 配套，通常一起变。" slotProps={{ htmlInput: { spellCheck: false } }} />
           <Grid cols={2}>
-            <TextField label="Authorization（留空保持原值）" value={authorization} onChange={(e) => setAuthorization(e.target.value)} autoComplete="off" disabled={busy} slotProps={{ htmlInput: { spellCheck: false } }} />
-            <TextField label="User-Agent（留空保持原值）" value={userAgent} onChange={(e) => setUserAgent(e.target.value)} autoComplete="off" disabled={busy} />
+            <TextField label="Authorization（留空保持原值）" value={authorization} onChange={(e) => setAuthorization(e.target.value)} autoComplete="off" disabled={busy} helperText="完整请求头值，一般是 Bearer <token>。" slotProps={{ htmlInput: { spellCheck: false } }} />
+            <TextField label="User-Agent（留空保持原值）" value={userAgent} onChange={(e) => setUserAgent(e.target.value)} autoComplete="off" disabled={busy} helperText="需与登录时的浏览器一致。" />
           </Grid>
           <Box>
             <Button
