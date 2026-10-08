@@ -14,6 +14,69 @@ let folders = [
 ];
 const plaintext = new Map();
 const now = Math.floor(Date.now() / 1000);
+
+// 立即赠送页的合成任务池。刻意做成"已核实为发送方受限"，因为这是
+// 2026-10-08 真实遇到的情况：预检只给一个 false 布尔值，界面必须能
+// 展示"已向 X 核实"的结论与X 原文，而不是笼统说接收方不可接收。
+const giftDemoState = [];
+function giftDemoTask(username, months) {
+  const t = now;
+  return {
+    task_id: "gift-demo" + Math.random().toString(16).slice(2, 10),
+    username,
+    months,
+    state: "failed",
+    created: t,
+    updated: t,
+    stage: {
+      percent: 30,
+      message: "发送账号被 X 限制，无权赠送（不是接收方的问题）",
+      at: t,
+      failed: true,
+      category: "sender_not_authorised",
+    },
+    stages: [
+      { percent: 25, message: "正在核对接收账号与赠送资格…", at: t },
+      { percent: 30, message: "资格预检未通过，正在向 X 核实真实原因…", at: t },
+      {
+        percent: 30,
+        message: "发送账号被 X 限制，无权赠送（不是接收方的问题）",
+        at: t,
+        failed: true,
+      },
+    ],
+    diagnosis: {
+      category: "sender_not_authorised",
+      summary: "发送账号被 X 限制，无权赠送（不是接收方的问题）",
+      detail:
+        "本地预检显示 premium_gifting_eligible=false；向 X 下单接口核实后得到：发送账号被 X 拒绝，无权赠送",
+      hint: "X 的原文说的是「当前用户没有赠送资格」，current user 指发送账号。换接收账号没有用。常见原因：赠送额度或频率超限、账号过新或未完成手机验证。",
+      x_code: 37,
+      x_message: "Current user is not eligible to gift",
+      stage: "正在核对接收账号与赠送资格…",
+    },
+  };
+}
+function giftDemoTasks() {
+  if (giftDemoState.length === 0) {
+    giftDemoState.push(giftDemoTask("demo_user", 3));
+    giftDemoState.push({
+      ...giftDemoTask("another_user", 6),
+      state: "succeeded",
+      card_last4: "4242",
+      message: "已付款：BDT 6 个月，接收方 @another_user（964248819520147456），尾号 4242。",
+      stage: { percent: 100, message: "赠送完成，付款已提交。", at: now, done: true },
+      diagnosis: undefined,
+      stages: [
+        { percent: 25, message: "正在核对接收账号与赠送资格…", at: now },
+        { percent: 50, message: "正在创建专属赠送订单…", at: now },
+        { percent: 80, message: "正在提交付款，请勿重复提交…", at: now },
+        { percent: 100, message: "赠送完成，付款已提交。", at: now, done: true },
+      ],
+    });
+  }
+  return giftDemoState;
+}
 let codes = ["active", "processing", "succeeded", "review", "revoked"].map(
   (status, index) => {
     // Two batches plus one unfiled code so client-side filtering is demonstrable.
@@ -196,7 +259,72 @@ createServer(async (req, res) => {
         });
         return;
       }
-      if (req.method === "GET" && url.pathname === "/api/admin/stats") {
+      // 后台设置页（/admin 的五个配置分区共用它）。
+    // 之前没实现，导致截图里全是禁用态空表单 —— 分不清是"设计如此"还是
+    // "数据没来"，视觉验证就失去意义。
+    if (req.method === "GET" && url.pathname === "/api/admin/settings") {
+      json(200, {
+        payments: true,
+        credentials: {
+          auth_token_tail: "…a648",
+          has_ct0: true,
+          authorization_set: true,
+          user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        },
+        cards: [{ last4: "2254", usable: true }, { last4: "1881", usable: true }],
+        stripe: { present: true, tail: "…9tHq" },
+        catalog: {
+          merchant: "acct_1Ika5JA3KZ32dPo1",
+          currency: "bdt",
+          plans: [
+            { months: 3, amount: 30000, product: "prod_TJXJtpzqCpI36N" },
+            { months: 6, amount: 60000, product: "prod_TJXKKNJwZJIhCM" },
+          ],
+        },
+        proxy: { direct: false, tags: ["Hy2-bd.zy3a.com"] },
+      });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/admin/settings/outbounds") {
+      json(200, {
+        configured: true,
+        nodes: 1,
+        tags: ["bd-dhaka-own (socks)"],
+        mode: "pool",
+        available: 1,
+        cooling: 0,
+        proxy_mode: "hysteria2",
+      });
+      return;
+    }
+    // 立即赠送页（2026-10-08 新增）。预览环境不连生产，所以这里造一段
+    // 会走完整阶段再失败的合成任务：预检 false → 向 X 核实 → 发送方受限。
+    // 这样能验证失败卡片的排版与文案，而不会真的建单。
+    if (req.method === "GET" && url.pathname === "/api/admin/gift/plans") {
+      json(200, {
+        plans: [
+          { months: 3, amount: 30000, currency: "BDT" },
+          { months: 6, amount: 60000, currency: "BDT" },
+        ],
+      });
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/admin/gift/tasks") {
+      json(200, { tasks: giftDemoTasks() });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/admin/gift") {
+      const task = giftDemoTask(body.username || "demo_user", Number(body.months) || 3);
+      giftDemoState.unshift(task);
+      json(202, { task_id: task.task_id, username: task.username, months: task.months, state: "queued" });
+      return;
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/api/admin/gift/")) {
+      const id = url.pathname.slice("/api/admin/gift/".length);
+      json(200, giftDemoState.find((t) => t.task_id === id) || giftDemoState[0] || {});
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/admin/stats") {
         const daily = [];
         for (let offset = 29; offset >= 0; offset--) {
           const day = new Date();

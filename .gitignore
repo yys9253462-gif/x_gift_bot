@@ -26,3 +26,6 @@ admin-password
 setup-password
 **/site.env
 !**/site.env.example
+
+# 视觉验证产物（tools/shoot.mjs 生成的截图，不入库）
+tools/shots/

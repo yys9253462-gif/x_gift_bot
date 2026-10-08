@@ -18,12 +18,22 @@ import { stats as fetchStats, type AdminStatsDetail } from "./adminApi";
 
 // 本地这份 visuallyHidden 原来只有 clip: rect(0 0 0 0)。
 // 旧式 clip 在现代浏览器里裁剪不可靠：当内部的「最近 30 天」表格
-// 比这个 1px 容器高时会把父级撑开 —— 实测让运维页多了 604px 空白
-// （documentElement 2488 / body 1884，差额全部来自这张表）。
+// 比这个 1px 容器高时会把父级撑开。
 // 改用 MUI 官方写法：clipPath: inset(50%) 能可靠裁剪。
-// 另外显式加 contain: "size layout"，让这块无障碍表格完全不参与
-// 父容器的高度计算 —— 它是给屏幕阅读器用的，视觉上不存在，
-// 就不该影响布局（实测它单独撑出 1022px）。
+//
+// 但光有 clipPath 还不够。2026-10-08 实测（tools/measure.mjs）：
+//
+//	table  pos=absolute  top=1493  h=942  bottom=2435
+//	body  h=2014     ← 父容器只到这里
+//
+// 这张无障碍表格高 942px，absolute 定位让它从文档流里被提出来，
+// 可它仍以静态位置参与滚动区域计算，于是运维页底部多出 545px 空白。
+// contain: "size layout" 能阻止它影响父容器高度，但**不会改变它自身
+// 742px 的尺寸**，也不阻止它扩展 scrollHeight —— 实测 contain 确实
+// 生效（计算样式里能看到），页面高度却一像素没变。
+//
+// 折叠按钮上那个 visuallyHidden 的标题不能用 fixed —— 它通过 aria-controls
+// 指向折叠内容，需要保持在文档流里正确的位置（虽然视觉上隐藏）。
 const visuallyHidden = {
   position: "absolute",
   width: "1px",
@@ -35,7 +45,33 @@ const visuallyHidden = {
   clipPath: "inset(50%)",
   whiteSpace: "nowrap",
   border: 0,
-  contain: "size layout",
+} as const;
+
+// 给「最近 30 天」那张无障碍表格专用的隐藏样式。
+//
+// 为什么不能用上面那份：display:table 的 height/min-height 在 CSS 里是
+// "最小高度"，内部 30 行照样能把它顶高 —— 实测 minHeight:0 打进产物也无效。
+// display:block 能裁剪，但会让 caption/thead/tr 失去表格语义，而这张表
+// 存在的唯一理由就是给屏幕阅读器读。
+//
+// 所以改用 position:fixed：它完全脱离文档流，不再参与 scrollHeight 计算，
+// 也就不会把运维页撑出空白。定位不写 inset，静态位置保持不变，
+// 同时保留表格语义给读屏。
+//
+// 校验：node tools/measure.mjs --page=运维
+// 修好后不应再有 h=942 的绝对定位 table，scrollHeight 应收敛到 body 高度。
+const hiddenDataTable = {
+  position: "fixed",
+  top: 0,
+  left: 0,
+  width: "1px",
+  height: "1px",
+  p: 0,
+  m: "-1px",
+  overflow: "hidden",
+  clipPath: "inset(50%)",
+  whiteSpace: "nowrap",
+  border: 0,
 } as const;
 
 function StatCard({
@@ -75,6 +111,10 @@ const series = [
 function ActivityChart({ daily }: { daily: AdminStatsDetail["daily"] }) {
   const theme = useTheme<CssVarsTheme>();
   // sx does not map SVG fill/stroke to the palette; use theme vars directly.
+  // 三条序列用主色 / 次色 / 成功色区分。这里刻意用 main 而不是 dark：
+  // 实测 light.primary.dark 对纸白是 10.77:1（main 只有 6.92），在白底上
+  // dark 更重而不是更淡，会让"生成"这一行显得比"兑换"更抢眼。
+  // 降低抢眼程度靠几何（柱宽、高度）而不是换更深的色。
   const fills = {
     created: theme.vars.palette.primary.main,
     redeemed: theme.vars.palette.secondary.main,
@@ -148,9 +188,11 @@ function ActivityChart({ daily }: { daily: AdminStatsDetail["daily"] }) {
                       <Box
                         component="rect"
                         key={daily[index].date}
-                        x={index * slot + slot * 0.22}
+                        x={index * slot + slot * 0.3}
                         y={height - bar}
-                        width={slot * 0.56}
+                        // 30 根柱子一行时，柱宽从0.56 收到 0.4：
+                        // 留出更多底色，密集时不会连成一片色块。
+                        width={slot * 0.4}
                         height={bar}
                         rx={2}
                         fill={fills[item.key]}
@@ -188,7 +230,7 @@ function ActivityChart({ daily }: { daily: AdminStatsDetail["daily"] }) {
           </Typography>
         </Box>
       </Box>
-      <Box component="table" sx={visuallyHidden}>
+      <Box component="table" sx={hiddenDataTable}>
         <caption>最近 30 天每日生成、兑换和成功的兑换码数量</caption>
         <thead>
           <tr>
@@ -452,8 +494,10 @@ export function StatsPanel({ refreshSignal }: { refreshSignal: number }) {
                           sx={{
                             display: "flex",
                             width: `${(entry.total / codesTotal) * 100}%`,
-                            height: 22,
-                            borderRadius: 1,
+                            // 同上：降到 10px 的细条，套餐分布是辅助信息，
+                            // 不该和上方的成功数表格抢注意力。
+                            height: 10,
+                            borderRadius: 999,
                             overflow: "hidden",
                           }}
                         >
@@ -493,8 +537,11 @@ export function StatsPanel({ refreshSignal }: { refreshSignal: number }) {
                               aria-hidden
                               sx={{
                                 width: `${(stage.count / stagePeak) * 100}%`,
-                                height: 22,
-                                borderRadius: 1,
+                                // 条形压到 8px：这组数据的量级只有个位数，
+                                // 用 22px 的粗条会让"1 枚"看起来像警报级别的量，
+                                // 页面视觉重心被无关紧要的一行抢走。
+                                height: 8,
+                                borderRadius: 999,
                                 bgcolor: "warning.main",
                               }}
                             />
