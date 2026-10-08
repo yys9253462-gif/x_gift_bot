@@ -282,6 +282,11 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/admin/recovery", s.admin(s.recoveryStatus))
 	mux.HandleFunc("POST /api/admin/recovery/preview", s.admin(s.recoveryPreview))
 	mux.HandleFunc("POST /api/admin/recovery/start", s.admin(s.recoveryStart))
+	// 立即赠送：填账号和时长，后台跑完整链路直到付款。
+	mux.HandleFunc("GET /api/admin/gift/plans", s.admin(s.giftPlans))
+	mux.HandleFunc("GET /api/admin/gift/tasks", s.admin(s.giftTasksList))
+	mux.HandleFunc("POST /api/admin/gift", s.admin(s.giftNow))
+	mux.HandleFunc("GET /api/admin/gift/{id}", s.admin(s.giftTask))
 	mux.HandleFunc("POST /api/admin/recovery/stop", s.admin(s.recoveryStop))
 	mux.HandleFunc("POST /api/admin/codes", s.admin(s.generate))
 	mux.HandleFunc("POST /api/admin/revoke", s.admin(s.revoke))
@@ -489,6 +494,11 @@ func (s *server) middleware(next http.Handler) http.Handler {
 			} else if r.URL.Path == "/api/check" {
 				max = 8
 				bucket = "check:"
+			} else if r.URL.Path == "/api/admin/gift" {
+				// 立即赠送会真的提交付款，因此单独限流：正常后台使用
+				// 一小时也发不了几单，误触或重复点击才是这里要挡的。
+				max = 20
+				bucket = "admin-gift:"
 			}
 			if !s.allow(bucket+ip, max) {
 				w.Header().Set("Retry-After", "60")

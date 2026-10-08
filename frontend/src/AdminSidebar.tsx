@@ -3,6 +3,7 @@ import { Box, Divider, List, ListItemButton, ListItemIcon, ListItemText, Tooltip
 import ConfirmationNumberOutlined from "@mui/icons-material/ConfirmationNumberOutlined";
 import SearchOutlined from "@mui/icons-material/SearchOutlined";
 import BuildOutlined from "@mui/icons-material/BuildOutlined";
+import SendOutlined from "@mui/icons-material/SendOutlined";
 import MenuOpenOutlined from "@mui/icons-material/MenuOpenOutlined";
 import MenuOutlined from "@mui/icons-material/MenuOutlined";
 import KeyOutlined from "@mui/icons-material/KeyOutlined";
@@ -25,6 +26,7 @@ export type AdminPage =
   | "catalog"
   | "outbounds"
   | "proxy"
+  | "gift"
   | "ops";
 
 type NavItem = { key: AdminPage; label: string; hint: string; icon: ReactElement };
@@ -45,6 +47,11 @@ const GROUPS: NavGroup[] = [
       { key: "catalog", label: "商品与价格", hint: "套餐时长、金额与商品", icon: <PaymentsOutlined /> },
       { key: "outbounds", label: "付款出站", hint: "决定 X 报价的区域", icon: <SettingsEthernetOutlined /> },
       { key: "proxy", label: "查询出口", hint: "账号资格查询的出口", icon: <CloudOutlined /> },
+    ],
+  },
+  {
+    items: [
+      { key: "gift", label: "立即赠送", hint: "填账号直接赠送并付款", icon: <SendOutlined /> },
     ],
   },
   {

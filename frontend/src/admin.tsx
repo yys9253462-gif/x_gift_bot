@@ -55,6 +55,7 @@ import { ManualPaymentPanel } from "./ManualPaymentPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { AdminSidebar, type AdminPage } from "./AdminSidebar";
 import { Panel } from "./Panel";
+import { GiftNowPanel } from "./GiftNowPanel";
 
 type Code = AdminCode;
 
@@ -67,6 +68,7 @@ const PAGE_META: Record<AdminPage, { title: string; hint: string }> = {
   catalog: { title: "商品与价格", hint: "告诉系统卖哪种会员、什么价。金额必须与 X 实际收取的一致。" },
   outbounds: { title: "付款出站", hint: "下单与询价都走这里的出口。X 按出口所在国报价，要低价区就把出口放在那个国家。" },
   proxy: { title: "查询出口", hint: "仅用于向 X 查询账号资格，不影响下单与定价。" },
+  gift: { title: "立即赠送", hint: "填接收账号和套餐时长，后台跑完整流程直到付款；失败时给出具体出错阶段。" },
   ops: { title: "运维", hint: "付款节点状态、手动补单与统计概览。" },
 };
 type Listing = {
@@ -455,6 +457,8 @@ function Admin() {
               />
             </Box>
           )}
+
+          {page === "gift" && <GiftNowPanel disabled={busy || loading} />}
 
           {page === "ops" && (
             <Box sx={{ display: "grid", gap: 3 }}>
