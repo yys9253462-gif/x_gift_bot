@@ -284,18 +284,30 @@ func (s *server) runGift(ctx context.Context, id string, task *giftTask, usernam
 				d := giftDiagnose(err, task.Stage.Percent, stage)
 				d.Hint += fmt.Sprintf("（额外尝试向X 核实判据时也失败：%v）", perr)
 				giftFail(task, d, rec)
-			case !verdict.SenderAuthorised:
-				// 这才是今晚的真实原因：X 拒的是发送账号。
-				giftFail(task, &giftDiagnosis{
-					Category: "sender_not_authorised",
-					Summary:  "发送账号被 X 限制，无权赠送（不是接收方的问题）",
-					Detail: fmt.Sprintf("本地预检显示 premium_gifting_eligible=false；"+
-						"向 X 下单接口核实后得到：%s", verdict.Reason),
-					Hint:  verdict.Hint,
-					XCode: verdict.XCode, XMessage: verdict.XMessage,
-					Stage: stage,
-				}, rec)
-			default:
+case !verdict.SenderAuthorised:
+			// X 拒的是发送账号（原文 current user），换接收方没有用。
+			giftFail(task, &giftDiagnosis{
+				Category: "sender_not_authorised",
+				Summary:  "发送账号被 X 限制，无权赠送（不是接收方的问题）",
+				Detail: fmt.Sprintf("本地预检显示 premium_gifting_eligible=false；"+
+					"向 X 下单接口核实后得到：%s", verdict.Reason),
+				Hint:  verdict.Hint,
+				XCode: verdict.XCode, XMessage: verdict.XMessage,
+				Stage: stage,
+			}, rec)
+		case !verdict.RecipientEligible:
+			// X 的原文明确指向接收方（原文 recipient user）。这次是核实过的
+			// 结论，不是从布尔字段推测出来的。
+			giftFail(task, &giftDiagnosis{
+				Category: "recipient_ineligible",
+				Summary:  "接收账号被 X 拒绝，无法接收赠送（已向 X 核实）",
+				Detail: fmt.Sprintf("本地预检显示 premium_gifting_eligible=false；"+
+					"向 X 下单接口核实后，X 的原文指向接收账号：%s", verdict.XMessage),
+				Hint:  verdict.Hint,
+				XCode: verdict.XCode, XMessage: verdict.XMessage,
+				Stage: stage,
+			}, rec)
+		default:
 				// X 其实接受了为该接收方建单：本地布尔值不可信，按X 的答复走。
 				giftUpdate(task, func(x *giftTask) {
 					x.Recipient = verdict.Recipient

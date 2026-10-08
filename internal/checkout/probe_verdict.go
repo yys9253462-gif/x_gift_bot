@@ -107,13 +107,26 @@ func ProbeGiftEligibility(ctx context.Context, v *vault.Vault, user string, port
 		verdict.Reason = "X 接受为该接收方创建订单（会话未付款）"
 		verdict.Hint = "该账号可以接收赠送，可以继续下单付款。"
 	case errors.Is(e, ErrGiftNotAuthorised):
-		// 关键区分：X 拒绝的是"当前用户"（发送账号），不是接收方。
-		verdict.SenderAuthorised = false
-		verdict.Reason = "发送账号被 X 拒绝，无权赠送（不是接收方的问题）"
-		verdict.Hint = "code 37 说的是「当前用户没有赠送资格」，指发送账号。" +
-			"换接收账号没有用。常见原因：赠送额度或频率超限、账号过新或未完成手机验证、账号本身受限。"
+		// 🔴 code 37 有两种含义完全相反的 message，必须看原文区分：
+		//
+		//   "Current user is not eligible to gift"    → 发送账号（current user = 我们）
+		//   "Recipient user is not eligible ..."      → 接收账号
+		//
+		// 实测两者都是 code 37 / AuthorizationError / Permissions。
+		// xapi.go 只按 code 分类，把接收方问题也归成了 ErrGiftNotAuthorised，
+		// 所以这里不能只看哨兵错误类型，必须读 message。
 		if code, msg := xErrorDetail(e); code != 0 {
 			verdict.XCode, verdict.XMessage = code, msg
+		}
+		if isSenderRefusal(verdict.XMessage) {
+			verdict.SenderAuthorised = false
+			verdict.Reason = "发送账号被 X 拒绝，无权赠送（不是接收方的问题）"
+			verdict.Hint = "X 的原文说的是「当前用户没有赠送资格」，current user 指发送账号。" +
+				"换接收账号没有用。常见原因：赠送额度或频率超限、账号过新或未完成手机验证、账号本身受限。"
+		} else {
+			verdict.Reason = "接收账号被 X 拒绝，无法接收赠送（已向 X 核实）"
+			verdict.Hint = "X 的原文明确指向接收账号：" + verdict.XMessage +
+				"。换接收账号有用。若确认该账号确实可接收，可先用 giftprobe 复核，再检查 X 侧是否有其它限制。"
 		}
 	case errors.Is(e, ErrOperationRejected):
 		verdict.Reason = "X 拒绝了请求本身（不是账号资格问题）"
@@ -126,6 +139,26 @@ func ProbeGiftEligibility(ctx context.Context, v *vault.Vault, user string, port
 		return ProbeVerdict{}, e
 	}
 	return verdict, nil
+}
+
+// isSenderRefusal 判断 X 的拒绝指向发送账号还是接收账号。
+//
+// X 用同一个 code 37 / AuthorizationError 表达两种相反的结论，区别只在
+// 消息主语：current user 是我们（发送方），recipient user 是对方。
+// 2026-10-08 实测两种消息都真实出现过：
+//
+//	Current user is not eligible to gift         → 四个不同接收方都返回这条
+//	Recipient user is not eligible to receive gift → 换到另一个接收方时返回这条
+func isSenderRefusal(message string) bool {
+	m := strings.ToLower(message)
+	// 先判接收方，因为它更具体；命中就一定不是发送方。
+	if strings.Contains(m, "recipient") {
+		return false
+	}
+	// 必须出现 current user 才算发送方。只有 "not eligible to gift" 而没有
+	// 主语时无法判定归属 —— 那就不能给出"换接收账号没有用"这种引导，
+	// 因为它可能完全指错方向。
+	return strings.Contains(m, "current user")
 }
 
 // xErrorDetail 从包装后的错误文本里取回 X 的 code 与 message。
