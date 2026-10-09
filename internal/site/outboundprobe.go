@@ -78,7 +78,13 @@ func probeOutbound(ctx context.Context, node []byte) (res probeResult) {
 		return
 	}
 	defer closeFn()
+	return probeOutboundHTTP(pctx, client, res)
+}
 
+// probeOutboundHTTP checks both destinations using the same outbound client.
+// Keeping HTTP checks separate also lets regression tests run without external traffic.
+func probeOutboundHTTP(pctx context.Context, client *http.Client, initial probeResult) (res probeResult) {
+	res = initial
 	req, err := http.NewRequestWithContext(pctx, "GET", "https://api.ipify.org?format=json", nil)
 	if err != nil {
 		res.Stage = "build"
@@ -107,16 +113,25 @@ func probeOutbound(ctx context.Context, node []byte) (res probeResult) {
 	res.IP = ip.IP
 
 	// 能连到 ipify 不代表能连到 X，所以直接打目标站。
-	if req2, e := http.NewRequestWithContext(pctx, "GET", "https://x.com/robots.txt", nil); e == nil {
-		if res2, e2 := client.Do(req2); e2 == nil {
-			res.XStatus = res2.StatusCode
-			res.ReachX = res2.StatusCode < 500
-			res2.Body.Close()
-		} else {
-			res.Stage = "x"
-			res.Message = "出口能连通，但无法连接 x.com：" + e2.Error()
-			return
-		}
+	req2, err := http.NewRequestWithContext(pctx, "GET", "https://x.com/robots.txt", nil)
+	if err != nil {
+		res.Stage = "build"
+		res.Message = "构建 X 请求失败：" + err.Error()
+		return
+	}
+	res2, err := client.Do(req2)
+	if err != nil {
+		res.Stage = "x"
+		res.Message = "出口能连通，但无法连接 x.com：" + err.Error()
+		return
+	}
+	res.XStatus = res2.StatusCode
+	res.ReachX = res2.StatusCode < 500
+	res2.Body.Close()
+	if !res.ReachX {
+		res.Stage = "x"
+		res.Message = fmt.Sprintf("出口能连通，但 x.com 返回 HTTP %d", res2.StatusCode)
+		return
 	}
 
 	res.OK = true

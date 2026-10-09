@@ -2,6 +2,10 @@ package site
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,6 +65,65 @@ func TestProbeRejectsInvalidConfigFirst(t *testing.T) {
 	// 配置错误应该瞬间返回，不该跑满连通性探测。
 	if wall > 3*time.Second {
 		t.Errorf("配置不合法却花了 %dms 才返回，应立即拦下", wall.Milliseconds())
+	}
+}
+
+type probeTestTransport func(*http.Request) (*http.Response, error)
+
+func (f probeTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestProbeXStatus(t *testing.T) {
+	for _, status := range []int{200, 403, 429, 500, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			calls := 0
+			client := &http.Client{Transport: probeTestTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				code, body := 200, `{"ip":"203.0.113.1"}`
+				if calls == 2 {
+					if r.URL.Host != "x.com" {
+						t.Fatalf("unexpected X destination: %s", r.URL)
+					}
+					code, body = status, "robots"
+				}
+				return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})}
+			res := probeOutboundHTTP(context.Background(), client, probeResult{Node: "test"})
+			wantOK := status < 500
+			if res.OK != wantOK || res.ReachX != wantOK || res.XStatus != status {
+				t.Fatalf("status %d: got %+v, want ok/reach_x=%v", status, res, wantOK)
+			}
+			if !wantOK && (res.Stage != "x" || !strings.Contains(res.Message, fmt.Sprint(status))) {
+				t.Fatalf("missing X failure details: %+v", res)
+			}
+			if calls != 2 || res.IP != "203.0.113.1" || res.Node != "test" {
+				t.Fatalf("probe metadata or request count lost: calls=%d result=%+v", calls, res)
+			}
+		})
+	}
+}
+
+func TestProbeHTTPFailures(t *testing.T) {
+	for _, failAt := range []int{1, 2} {
+		t.Run(fmt.Sprint(failAt), func(t *testing.T) {
+			calls := 0
+			client := &http.Client{Transport: probeTestTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if calls == failAt {
+					return nil, fmt.Errorf("test connection failed")
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ip":"203.0.113.1"}`)), Header: make(http.Header)}, nil
+			})}
+			res := probeOutboundHTTP(context.Background(), client, probeResult{})
+			stage := "exit"
+			if failAt == 2 {
+				stage = "x"
+			}
+			if res.OK || res.ReachX || res.Stage != stage || calls != failAt {
+				t.Fatalf("unexpected failure result: calls=%d result=%+v", calls, res)
+			}
+		})
 	}
 }
 
