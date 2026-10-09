@@ -7,7 +7,7 @@ REF=
 ORIGINAL_ARGS=("$@")
 ROOT=/opt/xgift
 DOMAIN= PORT= MODE= ACTION=install SOURCE_DIR=
-YES=0 DRY=0 DEPS=1 INTERACTIVE=0
+YES=0 DRY=0 DEPS=1 INTERACTIVE=0 FROM_SOURCE=0
 [[ ! -t 0 ]] || INTERACTIVE=1
 TMP= BACKUP= CADDY_STAGE= CHANGED=0 HAD_SERVICE=0
 SELF=$(realpath "${BASH_SOURCE[0]}")
@@ -29,6 +29,7 @@ XGift 交互式安装器（Debian/Ubuntu + systemd，amd64/arm64）
   --no-deps              不自动安装系统依赖
   --goproxy URL          Go 模块代理；off 表示只用直连
   --jobs N               覆盖自动选择的编译并行任务数
+  --build-from-source    跳过预编译下载，强制在目标机编译
   --upgrade              重新构建并升级，失败恢复旧程序和服务配置
   --status               查看服务状态，不安装依赖
   --uninstall            移除服务及本安装器的反代块，保留目录和全部数据
@@ -47,6 +48,7 @@ while (($#)); do
         --goproxy) GOPROXY_OVERRIDE=$2;; --jobs) JOBS_OVERRIDE=${2//[[:space:]]/}; [[ -n $JOBS_OVERRIDE ]] || die '--jobs 需要 1 以上的整数';;
       esac; shift 2;;
     --yes) YES=1; shift;; --dry-run) DRY=1; shift;; --no-deps) DEPS=0; shift;;
+    --build-from-source) FROM_SOURCE=1; shift;;
     --upgrade|--status|--uninstall)
       [[ $ACTION == install ]] || die '操作参数不能组合'
       ACTION=${1#--}; shift;;
@@ -251,6 +253,53 @@ check_resources() {
   if ((memory < 786432)); then log '提示：可用内存与 swap 合计不足 768 MiB，编译可能被 OOM 杀死；请增加内存或 swap 后重试。'; fi
 }
 # 编译并行度按可用内存与 CPU 核数决定。sing-box 带 QUIC/uTLS 标签，依赖树
+# 预编译二进制：从 GitHub Release 下载并在落盘前强制校验 SHA256。
+# 校验不是可选项——安装器随后会把这些二进制装成 root 服务，一个被替换的
+# 产物等于把整台机器交出去。校验不过就当作下载失败，交给调用方回退编译。
+# 返回 0 表示两个二进制都已就位且校验通过。
+download_prebuilt() {
+  local arch base tmp sums want got name
+  case $(uname -m) in
+    x86_64) arch=amd64;;
+    aarch64|arm64) arch=arm64;;
+    *) log "提示：架构 $(uname -m) 没有预编译产物，将改为在目标机编译"; return 1;;
+  esac
+  base="https://github.com/$REPO/releases/download/$REF"
+  tmp=$(mktemp -d)
+  # 任一分支退出都要清掉临时目录，避免半下载的二进制留在磁盘上。
+  if ! curl -fSL --retry 2 --retry-max-time 300 --connect-timeout 15 --max-time 300 \
+       "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
+    log "提示：$REF 没有发布预编译产物（或校验清单不可达），将改为在目标机编译"
+    rm -rf -- "$tmp"; return 1
+  fi
+  for name in xgift xgift-web; do
+    want=$(awk -v f="$name-linux-$arch" '$2 == f {print $1}' "$tmp/SHA256SUMS")
+    if [[ ! $want =~ ^[0-9a-f]{64}$ ]]; then
+      log "提示：校验清单里没有 $name-linux-$arch 的记录，将改为在目标机编译"
+      rm -rf -- "$tmp"; return 1
+    fi
+    if ! curl -fSL --retry 2 --retry-max-time 600 --connect-timeout 15 --max-time 600 \
+         "$base/$name-linux-$arch" -o "$tmp/$name" 2>/dev/null; then
+      log "提示：下载 $name-linux-$arch 失败，将改为在目标机编译"
+      rm -rf -- "$tmp"; return 1
+    fi
+    got=$(sha256sum "$tmp/$name" | awk '{print $1}')
+    if [[ $got != "$want" ]]; then
+      # 明确区分「下载坏了」和「被篡改」：后者要立刻停下让人看见。
+      log "错误：$name-linux-$arch 的 SHA256 不匹配"
+      log "  期望 $want"
+      log "  实际 $got"
+      log '产物可能已损坏或被替换，已放弃安装预编译版本，不写入任何文件。'
+      rm -rf -- "$tmp"; return 1
+    fi
+    log "校验通过：$name-linux-$arch"
+  done
+  mkdir -p "$TMP/bin"
+  mv "$tmp/xgift" "$tmp/xgift-web" "$TMP/bin/"
+  chmod 700 "$TMP/bin/xgift" "$TMP/bin/xgift-web"
+  rm -rf -- "$tmp"
+  return 0
+}
 # 很大，单核编译在正常配置的机器上要慢一个数量级；而在 1 GiB 无 swap 的小机
 # 上放开并行又会被 OOM 杀死。所以两边都要看，而不是写死。
 #   1.5 GiB 及以上：放开到 CPU 核数（上限 8），这是普通 VPS 和家用机的常态。
@@ -490,41 +539,59 @@ TMP=$(mktemp -d)
 trap rollback EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if [[ -n $SOURCE_DIR ]]; then
-  [[ -d $SOURCE_DIR && -f $SOURCE_DIR/go.mod && -f $SOURCE_DIR/deploy/install.sh ]] || die '源码目录不完整'
-  mkdir "$TMP/src"
-  cp -a "$SOURCE_DIR/." "$TMP/src/"
+# 优先用 Release 里的预编译二进制：用户不必装 Go 工具链、拉 1.4 GB 依赖树、
+# 再花几分钟编译。下载或校验失败都自动回退到在目标机编译，不会因为发布侧
+# 的问题让用户装不上。--source-dir 与 --build-from-source 直接走编译。
+PREBUILT=0
+if ((DRY)); then
+  log 'dry-run：跳过预编译下载与编译。'
+elif ((FROM_SOURCE)); then
+  log '按 --build-from-source 在目标机编译。'
+elif [[ -n $SOURCE_DIR ]]; then
+  log '按 --source-dir 使用本机源码编译。'
+elif download_prebuilt; then
+  PREBUILT=1
+  log "已取得校验通过的预编译程序（$REF）；跳过工具链下载与编译。"
 else
-  for attempt in 1 2 3; do
-    if timeout 300 git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$TMP/src"; then break; fi
-    rm -rf -- "$TMP/src"
-    ((attempt < 3)) || die '源码下载失败（3 次，单次限时 300 秒）；检查 GitHub 连通性或使用 --source-dir'
-  done
+  log '改为在目标机编译。'
 fi
-GO_VERSION=$(awk '$1=="go" {gsub(/\r/,"",$2); print $2; exit}' "$TMP/src/go.mod")
-[[ $GO_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'go.mod 的 Go 版本格式不支持'
-case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) die '仅支持 amd64/arm64';; esac
-GO_HOME="$ROOT/toolchains/go$GO_VERSION"
-if [[ ! -x $GO_HOME/bin/go ]]; then
-  curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 'https://go.dev/dl/?mode=json&include=all' -o "$TMP/go.json"
-  SHA=$(python3 -c 'import json,sys; vs=json.load(open(sys.argv[1])); fs=[f for v in vs if v["version"]==sys.argv[2] for f in v["files"] if f["filename"]==sys.argv[3]]; assert len(fs)==1,"Go archive unavailable"; print(fs[0]["sha256"])' "$TMP/go.json" "go$GO_VERSION" "go$GO_VERSION.linux-$ARCH.tar.gz")
-  curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 "https://go.dev/dl/go$GO_VERSION.linux-$ARCH.tar.gz" -o "$TMP/go.tar.gz"
-  printf '%s  %s\n' "$SHA" "$TMP/go.tar.gz" | sha256sum -c -
-  mkdir -p "$ROOT/toolchains"
-  tar -xzf "$TMP/go.tar.gz" -C "$TMP"
-  mv "$TMP/go" "$GO_HOME"
+if ((PREBUILT == 0 && DRY == 0)); then
+  if [[ -n $SOURCE_DIR ]]; then
+    [[ -d $SOURCE_DIR && -f $SOURCE_DIR/go.mod && -f $SOURCE_DIR/deploy/install.sh ]] || die '源码目录不完整'
+    mkdir "$TMP/src"
+    cp -a "$SOURCE_DIR/." "$TMP/src/"
+  else
+    for attempt in 1 2 3; do
+      if timeout 300 git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$TMP/src"; then break; fi
+      rm -rf -- "$TMP/src"
+      ((attempt < 3)) || die '源码下载失败（3 次，单次限时 300 秒）；检查 GitHub 连通性或使用 --source-dir'
+    done
+  fi
+  GO_VERSION=$(awk '$1=="go" {gsub(/\r/,"",$2); print $2; exit}' "$TMP/src/go.mod")
+  [[ $GO_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'go.mod 的 Go 版本格式不支持'
+  case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) die '仅支持 amd64/arm64';; esac
+  GO_HOME="$ROOT/toolchains/go$GO_VERSION"
+  if [[ ! -x $GO_HOME/bin/go ]]; then
+    curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 'https://go.dev/dl/?mode=json&include=all' -o "$TMP/go.json"
+    SHA=$(python3 -c 'import json,sys; vs=json.load(open(sys.argv[1])); fs=[f for v in vs if v["version"]==sys.argv[2] for f in v["files"] if f["filename"]==sys.argv[3]]; assert len(fs)==1,"Go archive unavailable"; print(fs[0]["sha256"])' "$TMP/go.json" "go$GO_VERSION" "go$GO_VERSION.linux-$ARCH.tar.gz")
+    curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 "https://go.dev/dl/go$GO_VERSION.linux-$ARCH.tar.gz" -o "$TMP/go.tar.gz"
+    printf '%s  %s\n' "$SHA" "$TMP/go.tar.gz" | sha256sum -c -
+    mkdir -p "$ROOT/toolchains"
+    tar -xzf "$TMP/go.tar.gz" -C "$TMP"
+    mv "$TMP/go" "$GO_HOME"
+  fi
+  export PATH="$GO_HOME/bin:$PATH" CGO_ENABLED=1
+  # Parallelism and module proxy are chosen for the machine, not fixed at the
+  # values a 1 GiB VPS needs. Never change host swap automatically.
+  plan_build_parallelism
+  setup_go_proxy
+  export GOPATH="$ROOT/build-cache/gopath" GOCACHE="$ROOT/build-cache/go-build"
+  mkdir "$TMP/bin"
+  log "开始编译（首次安装需拉取 sing-box 依赖树，耗时取决于网络；进度见下方 go downloading 输出）"
+  START_BUILD=$(date +%s)
+  (cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
+  log "编译完成，用时 $(( $(date +%s) - START_BUILD )) 秒"
 fi
-export PATH="$GO_HOME/bin:$PATH" CGO_ENABLED=1
-# Parallelism and module proxy are chosen for the machine, not fixed at the
-# values a 1 GiB VPS needs. Never change host swap automatically.
-plan_build_parallelism
-setup_go_proxy
-export GOPATH="$ROOT/build-cache/gopath" GOCACHE="$ROOT/build-cache/go-build"
-mkdir "$TMP/bin"
-log "开始编译（首次安装需拉取 sing-box 依赖树，耗时取决于网络；进度见下方 go downloading 输出）"
-START_BUILD=$(date +%s)
-(cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
-log "编译完成，用时 $(( $(date +%s) - START_BUILD )) 秒"
 # Stage and validate the reverse proxy before touching the running application.
 if [[ $MODE == caddy ]]; then
   CADDY_STAGE=$(mktemp /etc/caddy/.xgift-stage-XXXXXX)
