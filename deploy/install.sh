@@ -395,15 +395,30 @@ download_prebuilt() {
        "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
     # 这里必须把「为什么取不到」说清楚。用户看到的下一件事会是满屏 go: downloading，
     # 如果不说原因，他会以为"这个项目必须编译"——其实只是 ref 取错了。
+    #
+    # 取状态码时要注意：curl 连接失败会**同时**输出 000 并返回非 0，若写成
+    # `$(curl -w '%{http_code}' ... || echo 000)`，失败时就会拼出 "000000"，
+    # 于是 000 分支匹配不上、落进 else 打印 "HTTP 000000" 这种含糊值。
+    # 所以先取输出、失败时也只保留 curl 自己吐的那份（为空才补 000），并只取末 3 位。
     local code
-    code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$base/SHA256SUMS" 2>/dev/null || echo '000')
+    code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$base/SHA256SUMS" 2>/dev/null) || true
+    code=${code: -3}
+    [[ $code =~ ^[0-9]{3}$ ]] || code=000
     if [[ $code == 404 ]]; then
       log "原因：$REF 不是一个带预编译产物的发布版本（HTTP 404）。"
       if [[ $REF == main ]]; then
-        log '  未指定 --ref 时默认走 main 分支，而 main 上没有 Release 产物。'
+        log '  main 是开发分支而非发布版本，它上面没有 Release 产物。'
+        log '  通常不必手动指定：不写 --ref 时安装器会自动选用最新发布版本。'
       fi
       log '  可用版本见：https://github.com/'"$REPO"'/releases'
-      log "  指定发布版本即可无需编译：加 --ref <版本号>（例如 --ref $(latest_release_ref 2>/dev/null || echo v0.1.0)）"
+      # 只有查到具体版本号时才给出可复制的示例；查不到就不要编一个出来。
+      local hint
+      hint=$(latest_release_ref 2>/dev/null || true)
+      if [[ -n $hint ]]; then
+        log "  指定发布版本即可无需编译：加 --ref $hint"
+      else
+        log '  指定发布版本即可无需编译：加 --ref <版本号>'
+      fi
     elif [[ $code == 000 ]]; then
       log '原因：无法连接 GitHub（网络不可达或超时），因此取不到预编译产物。'
     else
