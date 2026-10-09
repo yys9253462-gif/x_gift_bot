@@ -82,11 +82,13 @@ curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/re
 | 两端口空闲 | 安装/使用宿主 Caddy，追加站点并校验、重载 | 需标准 `/etc/caddy/Caddyfile`、DNS 正确且 80/443 可达 |
 | 宿主 Caddy | 复用 Caddy，自有标记块更新，保留其他站点 | 同域名已在非托管配置出现则停止；自定义配置路径未自动适配 |
 | 宿主 Nginx | 写独立 `/etc/nginx/conf.d/xgift-installer.conf`；Certbot webroot 签发，启用续期 timer 和重载 hook | 需宿主 nginx 命令、有效配置且实际加载 conf.d；不覆盖非托管文件或现有同名站点 |
-| 容器反代、混合监听或其他服务 | 停止并提示，不停止原服务 | 使用 `--https external` 后自行接入；未自动修改容器或其他反代 |
+| 容器反代、混合监听或其他服务 | 停止并提示，不停止原服务 | 交互模式可选择改用 `--https external`（明确同意后）；非交互需显式指定。未自动修改容器或其他反代 |
 
-Caddy/Nginx 路径必须通过本机服务与公网 HTTPS 健康检查才报告完成；`external` 只验证本机服务，不签发证书、不验证外部 HTTPS。域名冲突、错误 AAAA、云安全组、防火墙、CDN 回源、非标准宿主配置和证书签发限制都可能需要人工处理，**不保证首次安装必定成功**。非 HTTP 服务占用同一入口的 443 时，不能靠新增 HTTP 站点直接共享；需迁移端口、另一个入口或外部反代。
+Caddy/Nginx 路径必须通过本机服务与公网 HTTPS 健康检查才报告完成；`external` 只验证本机服务，不签发证书、不验证外部 HTTPS。安装器在编译前先检查域名解析，解析失败会直接终止；出现 IPv6 记录时会提示确认本机 IPv6 与入站连通性，但不会修改 DNS、防火墙或 CDN。域名冲突、错误 AAAA、云安全组、防火墙、CDN 回源、非标准宿主配置和证书签发限制都可能需要人工处理，**不保证首次安装必定成功**。非 HTTP 服务占用同一入口的 443 时，不能靠新增 HTTP 站点直接共享；需迁移端口、另一个入口或外部反代。
 
 自动 HTTPS 完成（external 则先接好 HTTPS）后，打开 `https://gift.example.com/setup`，填写安装器显示的初始化口令，并设置、确认管理员密码（32–256 UTF-8 字节，不允许首尾空白、换行或空字符）。保存后点击网页重启，或运行 `systemctl restart xgift`；然后使用 `admin` 和自己设置的密码进入 `/admin` 配置业务。自动付款默认关闭；配置齐全后编辑 `/opt/xgift/site.env`，将 `XGIFT_PAYMENTS_ENABLED=false` 改为 `true` 并重启。部署、初始化、健康检查和重启本身不会发起付款。
+
+启用付款后若卡池或出站尚未配置，服务仍会正常启动并开放后台，只是充值入口保持关闭，后台侧栏显示「充值未开放：重启后生效」；补齐支付卡与节点后重启一次即开放。加密数据损坏仍会直接让服务启动失败，避免带着坏配置运行。
 
 ```sh
 # 非交互安装 / 仅预览计划
@@ -101,6 +103,14 @@ bash /opt/xgift/install.sh --uninstall
 ```
 
 默认安装到 `/opt/xgift`，支持 `--dir`、`--port`、`--ref`、`--no-deps`；发布前或离线源码验收可使用 `--source-dir /绝对路径/源码`。编译采用单任务和内存软限制，适合小内存 VPS；完整参数运行 `--help`。重跑保留数据、密码与付款开关。升级有本机健康门禁，失败恢复旧程序及服务配置；不回滚数据库。卸载保留全部数据与密码，不删除系统依赖。备份时必须同时保留 `data/` 和 `secrets/`；历史程序备份位于 `backups/`，由管理员按需要清理。
+
+安装器还会提前检查并明确提示：磁盘与可用内存、域名解析结果（含 IPv6 提醒）、80/443 实际占用者、宿主反代配置是否已包含该域名、安装目录父路径是否允许服务用户遍历。发现问题时会在下载和编译之前终止，不会留下改到一半的系统状态。
+
+> **升级到新版安装器**：早期版本的安装器不会自动换成本文档描述的新版逻辑。请先重新下载安装脚本，再执行升级：
+>
+> ```sh
+> curl -fSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main' -o /tmp/xgift-install.sh && sudo bash /tmp/xgift-install.sh --upgrade
+> ```
 
 安装器 CLI 回归：`python3 deploy/install_test.py`。完整安装、HTTPS 签发和卸载应在独立 Linux 测试机验收。
 
