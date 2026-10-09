@@ -39,9 +39,30 @@ func (s *server) checkSetupPassword(submitted string) bool {
 	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
-// setupStatus lets the page know whether bootstrap is still open.
+// setupStatus lets the page know whether bootstrap is still open, and whether
+// the administrator password is already on disk. A reply that never reached
+// the browser leaves the operator re-submitting the same form, so the page has
+// to be able to recover that state instead of guessing from a 409.
 func (s *server) setupStatus(w http.ResponseWriter, r *http.Request) {
-	reply(w, 200, map[string]any{"bootstrap": s.bootstrapEnabled()})
+	saved := s.adminPasswordSaved()
+	reply(w, 200, map[string]any{
+		"bootstrap":   s.bootstrapEnabled(),
+		"admin_saved": saved,
+		// A restart only means anything once the password exists: the setup
+		// routes stay registered until the process comes back up.
+		"restart_required": s.bootstrapEnabled() && saved,
+	})
+}
+
+// adminPasswordSaved reports whether an administrator password file is already
+// present. It is deliberately based on the file, not on in-memory state: the
+// operator is asking precisely because the apply response may have been lost.
+func (s *server) adminPasswordSaved() bool {
+	if s.adminPath == "" {
+		return false
+	}
+	info, err := os.Lstat(s.adminPath)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // setupApply creates only the administrator password. Business credentials are
@@ -70,6 +91,15 @@ func (s *server) setupApply(w http.ResponseWriter, r *http.Request) {
 	// Only establish the administrator; business settings belong in the authenticated backend.
 	if err := s.writeAdminPassword(f.AdminPassword); err != nil {
 		if errors.Is(err, errAlreadyInitialised) {
+			// The write reached disk but the reply did not: the same request is
+			// not a fresh initialisation, so answer it as the success it was.
+			// Anything else stays a conflict, because confirming it would tell
+			// the operator a password was stored that never was.
+			if s.adminPasswordMatches(f.AdminPassword) {
+				log.Printf("bootstrap repeated with the identical password; reporting success and asking for a restart")
+				reply(w, 200, map[string]any{"ok": true, "already_saved": true, "restart_required": true})
+				return
+			}
 			message(w, 409, "站点已完成初始化，请重启服务后使用管理后台。")
 			return
 		}
@@ -78,7 +108,23 @@ func (s *server) setupApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("bootstrap completed; restart required to leave setup mode")
-	reply(w, 200, map[string]any{"ok": true, "restart_required": true})
+	reply(w, 200, map[string]any{"ok": true, "already_saved": false, "restart_required": true})
+}
+
+// adminPasswordMatches compares the submitted password with the stored file in
+// constant time. A missing or unreadable file never matches, so a read problem
+// falls through to the conflict response instead of confirming success.
+func (s *server) adminPasswordMatches(submitted string) bool {
+	stored, err := privateFile(s.adminPath)
+	if err != nil {
+		log.Printf("stored admin password is unreadable: %v", err)
+		return false
+	}
+	stored = []byte(strings.TrimSpace(string(stored)))
+	defer clear(stored)
+	got := sha256.Sum256([]byte(submitted))
+	want := sha256.Sum256(stored)
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 var errAlreadyInitialised = errors.New("admin password file already exists")

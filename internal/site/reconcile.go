@@ -11,8 +11,12 @@ import (
 	"xgift/internal/checkout"
 )
 
+// paymentsAvailable gates every public payment entry point. A configuration
+// that was incomplete at boot closes the gate as well; the running server
+// keeps that verdict, so a payment can never start before the operator has
+// finished the settings and only a restart re-evaluates it.
 func (s *server) paymentsAvailable() (bool, error) {
-	if !s.payments {
+	if !s.payments || s.paymentBlocked.Load() {
 		return false, nil
 	}
 	paused, err := checkout.PaymentPaused(s.vault)

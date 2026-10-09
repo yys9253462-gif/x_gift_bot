@@ -127,5 +127,9 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	paymentsReady, _ := s.paymentsAvailable()
-	reply(w, 200, map[string]any{"codes": codes, "payments_enabled": paymentsReady, "page": page, "has_more": hasMore, "folder": filter, "folders": folders, "stats": stats})
+	// Report the boot verdict separately from the live verdict. An operator who
+	// has just finished the card and node settings needs to know that the site
+	// is closed because it has not been restarted, not because the settings are
+	// still wrong.
+	reply(w, 200, map[string]any{"codes": codes, "payments_enabled": paymentsReady, "payments_blocked": s.paymentBlocked.Load(), "page": page, "has_more": hasMore, "folder": filter, "folders": folders, "stats": stats})
 }

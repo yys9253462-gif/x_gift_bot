@@ -191,8 +191,16 @@ func (s *server) giftNow(w http.ResponseWriter, r *http.Request) {
 		message(w, 400, "该套餐时长未配置，请先在「商品与价格」里配置。")
 		return
 	}
+	// An incomplete card pool is the boot-time verdict this server carries, so a
+	// queued gift cannot enter a payment path that is known to be unusable yet.
+	// Manual gifting is admin-only and needs no card, but this endpoint spends
+	// real money, so it stays closed until the configuration is finished.
 	if !s.payments {
 		message(w, 503, "充值未开放，站点未启用付款。")
+		return
+	}
+	if s.paymentBlocked.Load() {
+		message(w, 503, "充值未开放：付款配置未完成或尚未重启，请在后台「设置」补齐支付卡与节点后重启服务。")
 		return
 	}
 	select {

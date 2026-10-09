@@ -6,6 +6,7 @@ package site
 // ever sent back to the browser.
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -210,9 +211,16 @@ func (s *server) saveCredentials(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]any{"ok": true})
 }
 
-// currentCookiePair reads the stored auth_token and ct0.
+// currentCookiePair reads the stored auth_token and ct0. A vault that has never
+// held a cookies record is an empty old value: the operator is configuring the
+// site for the first time and there is nothing to merge with. Any other read
+// failure is returned, because treating an unreadable record as empty would
+// overwrite whatever was actually configured.
 func (s *server) currentCookiePair() (string, string, error) {
 	raw, err := s.vault.Get("cookies")
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
 	if err != nil {
 		return "", "", err
 	}

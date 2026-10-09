@@ -12,7 +12,7 @@
 <p>只需建立管理员账号。X 登录凭据、支付卡、付款节点和商品价格，进入后台后再逐项设置。</p>
 <form id="setup-form">
 <label>初始化口令<input id="setup-password" type="password" autocomplete="off" required><small>使用服务器安装完成时显示的口令，验证这台站点属于你。</small></label>
-<label>后台密码<input id="admin-password" type="password" autocomplete="new-password" minlength="32" maxlength="256" required><small>至少 32 字节，建议使用密码管理器生成并保存。</small></label>
+<label>后台密码<input id="admin-password" type="password" autocomplete="new-password" required><small>32–256 UTF-8 字节，不能包含首尾空格、换行或空字符；建议使用密码管理器生成并保存。</small></label>
 <label>确认后台密码<input id="admin-confirm" type="password" autocomplete="new-password" required></label>
 <button id="submit" type="submit">创建管理员并进入后台</button>
 </form>

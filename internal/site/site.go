@@ -53,15 +53,19 @@ type server struct {
 	bootstrap        atomic.Bool
 	stateMu          sync.RWMutex
 	payments         bool
-	port             int
-	lockPath         string
-	work             chan struct{}
-	checks           chan struct{}
-	jobs             sync.WaitGroup
-	ctx              context.Context
-	recoveryMu       sync.Mutex
-	limitsMu         sync.Mutex
-	limits           map[string]limit
+	// paymentBlocked records that the payment setup was incomplete at boot. It
+	// is separate from payments so a missing configuration can close the public
+	// payment entry point without taking the admin backend down with it.
+	paymentBlocked atomic.Bool
+	port           int
+	lockPath       string
+	work           chan struct{}
+	checks         chan struct{}
+	jobs           sync.WaitGroup
+	ctx            context.Context
+	recoveryMu     sync.Mutex
+	limitsMu       sync.Mutex
+	limits         map[string]limit
 }
 type limit struct {
 	start time.Time
@@ -158,9 +162,19 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	defer v.Close()
+	// An unfinished payment configuration is not a boot failure: the admin page
+	// is exactly where the operator fixes it, and a service that exits here
+	// leaves no way in at all. Unreadable vault data still fails the boot, so a
+	// corrupted record is never mistaken for an empty one.
+	s.paymentBlocked.Store(true)
 	if s.payments && !bootstrap {
-		if err = checkout.CheckPaymentConfiguration(v); err != nil {
-			return err
+		switch configErr := checkout.CheckPaymentConfiguration(v); {
+		case configErr == nil:
+			s.paymentBlocked.Store(false)
+		case errors.Is(configErr, checkout.ErrNoUsableCard), errors.Is(configErr, sql.ErrNoRows):
+			log.Printf("payment configuration incomplete (%v); public payments stay closed until the admin settings are completed", configErr)
+		default:
+			return configErr
 		}
 	}
 	dbpath := filepath.Join(dir, "site.db")
@@ -229,11 +243,11 @@ func Run(ctx context.Context) error {
 	}
 	raw, err := v.Get("proxy")
 	if err != nil {
-		if !bootstrap {
+		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		// Bootstrap has no stored proxy yet, but the embedded sing-box still
-		// has to start so the form can be served. A direct outbound is enough.
+		// Password-only setup leaves proxy unset even after bootstrap. Use an
+		// in-memory direct outbound only for an absent record; never hide read errors.
 		raw = []byte(`{"outbounds":[{"type":"direct","tag":"direct"}]}`)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
