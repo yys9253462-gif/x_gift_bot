@@ -237,6 +237,9 @@ func Run(ctx context.Context) error {
 	if err = migrateBatches(db); err != nil {
 		return err
 	}
+	if err = migratePartner(db); err != nil {
+		return err
+	}
 	// A crash is never interpreted as permission to submit the same payment again.
 	if _, err = db.Exec("UPDATE codes SET status='review',message=?,updated=? WHERE status='processing'", "订单处理被中断，请查询原订单或联系管理员核实；请勿重复兑换。", time.Now().Unix()); err != nil {
 		return err
@@ -285,6 +288,10 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/manual-link", s.human("manual_link", s.publicLink))
 	mux.HandleFunc("POST /api/status", s.status)
 	mux.HandleFunc("POST /api/check", s.human("check", s.check))
+	// 商城发货：独立 API Key 通道，只做发码与作废，不复用管理员凭据。
+	mux.HandleFunc("GET /api/partner/ping", s.partner(s.partnerPing))
+	mux.HandleFunc("POST /api/partner/fulfill", s.partner(s.partnerFulfill))
+	mux.HandleFunc("POST /api/partner/revoke", s.partner(s.partnerRevoke))
 	mux.HandleFunc("GET /admin", s.admin(s.asset("admin.html", "text/html; charset=utf-8")))
 	mux.HandleFunc("GET /admin.js", s.admin(s.asset("admin.js", "application/javascript; charset=utf-8")))
 	mux.HandleFunc("GET /api/admin/codes", s.admin(s.list))
@@ -313,6 +320,9 @@ func Run(ctx context.Context) error {
 	// first-run page below is conditional.
 	mux.HandleFunc("GET /api/admin/settings", s.admin(s.adminSettings))
 	mux.HandleFunc("POST /api/admin/settings/credentials", s.admin(s.saveCredentials))
+	mux.HandleFunc("GET /api/admin/settings/partner", s.admin(s.partnerKeyStatus))
+	mux.HandleFunc("POST /api/admin/settings/partner", s.admin(s.setPartnerKey))
+	mux.HandleFunc("POST /api/admin/settings/partner/rotate", s.admin(s.rotatePartnerKey))
 	mux.HandleFunc("POST /api/admin/settings/cards", s.admin(s.addCards))
 	mux.HandleFunc("POST /api/admin/settings/cards/remove", s.admin(s.removeCard))
 	mux.HandleFunc("POST /api/admin/settings/cards/unblock", s.admin(s.unblockCards))
@@ -518,6 +528,11 @@ func (s *server) middleware(next http.Handler) http.Handler {
 				// 真正的风险是误触或脚本重复提交，那才是这里要挡的。
 				max = 20
 				bucket = "admin-gift:"
+			} else if strings.HasPrefix(r.URL.Path, "/api/partner/") {
+				// 商城调用按订单量走，业务高峰时每分钟可能上百次；
+				// 与普通 API 共用一个桶会让正常发货被自己的其它请求挤掉。
+				max = 600
+				bucket = "partner:"
 			}
 			if !s.allow(bucket+ip, max) {
 				w.Header().Set("Retry-After", "60")
