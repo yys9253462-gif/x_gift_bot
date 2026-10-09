@@ -70,12 +70,14 @@ npm run preview
 在**目标服务器**运行（Debian/Ubuntu、systemd、amd64/arm64），先把域名 DNS 指向该服务器：
 
 ```sh
-curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main -o /tmp/xgift-install.sh && bash /tmp/xgift-install.sh
+curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main -o /tmp/xgift-install.sh && bash /tmp/xgift-install.sh --ref v0.1.0
 ```
 
 请以 root 登录执行；非 root 用户将最后的 `bash` 改成 `sudo bash`。下载失败时不会继续运行，也不会让下载管道占用交互输入。
 
-安装器询问域名和确认后，**优先下载官方 GitHub Release 里对应架构的预编译程序**（当前上游仓库已有发布时，通常几十秒即可装完，无需在目标机编译）；下载后先核对 `SHA256SUMS` 中的 SHA256，校验不通过或没有匹配架构的产物时，会自动回退到源码编译，不会留下任何未经验证的文件。回退路径会自动安装编译依赖与匹配 `go.mod` 的 Go（官方 SHA256 校验，不替换系统 Go）、构建两个程序。两条路径都会配置 systemd 并生成保管库密码和初始化口令，默认自动选空闲本机端口（从 8787 起）。回退到源码编译时首次构建可能耗时较长（取决于网络与机器）；编译并行度与 Go 内存软限制不等于总内存上限，仍可能遇到 OOM、下载或编译失败。
+> **`--ref v0.1.0` 是关键，不要省略。** 它指定使用已发布的正式版本，安装器据此下载对应架构的预编译程序，通常几十秒装完。若不加 `--ref`，默认跟随 `main` 分支，而 `main` 没有对应的 Release 产物，安装器只能回退到在目标机上从源码编译——耗时数分钟到数十分钟，小内存机器（1 GiB 上下且无 swap）还可能触发 OOM。源码编译依赖 `github.com` 与 `proxy.golang.org` 的连通性，网络不畅时同样会失败。
+
+安装器询问域名和确认后，**优先下载官方 GitHub Release 里对应架构的预编译程序**（通常几十秒即可装完，无需在目标机编译）；下载后先核对 `SHA256SUMS` 中的 SHA256，校验不通过或没有匹配架构的产物时，会自动回退到源码编译，不会留下任何未经验证的文件。回退路径会自动安装编译依赖与匹配 `go.mod` 的 Go（官方 SHA256 校验，不替换系统 Go）、构建两个程序。两条路径都会配置 systemd 并生成保管库密码和初始化口令，默认自动选空闲本机端口（从 8787 起）。回退到源码编译时首次构建可能耗时较长（取决于网络与机器）；编译并行度与 Go 内存软限制不等于总内存上限，仍可能遇到 OOM、下载或编译失败。
 
 | 80/443 场景 | `--https auto` 行为 | 边界 |
 |---|---|---|
@@ -110,10 +112,10 @@ bash /opt/xgift/install.sh --uninstall
 
 安装器还会提前检查并明确提示：磁盘与可用内存、域名解析结果（含 IPv6 提醒）、80/443 实际占用者、宿主反代配置是否已包含该域名、安装目录父路径是否允许服务用户遍历。发现问题时会在下载和编译之前终止，不会留下改到一半的系统状态。
 
-> **升级到新版安装器**：早期版本的安装器不会自动换成本文档描述的新版逻辑。请先重新下载安装脚本，再执行升级：
+> **升级到新版安装器**：早期版本的安装器不会自动换成本文档描述的新版逻辑。请先重新下载安装脚本，再执行升级（同样建议带上 `--ref v0.1.0`）：
 >
 > ```sh
-> curl -fSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main' -o /tmp/xgift-install.sh && sudo bash /tmp/xgift-install.sh --upgrade
+> curl -fSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main' -o /tmp/xgift-install.sh && sudo bash /tmp/xgift-install.sh --upgrade --ref v0.1.0
 > ```
 
 安装器 CLI 回归：`python3 deploy/install_test.py`。完整安装、HTTPS 签发和卸载应在独立 Linux 测试机验收。
