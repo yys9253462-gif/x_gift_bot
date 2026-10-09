@@ -1,5 +1,6 @@
 """Installer CLI regression checks; no root, downloads or system changes."""
 import os
+import re
 import shlex
 from pathlib import Path
 import subprocess
@@ -73,10 +74,97 @@ class InstallerCLI(unittest.TestCase):
 
     def run_function(self, name, body):
         import re
-        match = re.search(r"^" + name + r"\(\) \{\n.*?^\}(?=\n(?:[a-z_]+\(\)|if |# |$))", SCRIPT.read_text(), re.M | re.S)
-        self.assertIsNotNone(match, f"missing testable function {name}")
-        return subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + match.group(0) + "\n" + body],
+        return subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + self.extract_function(name) + "\n" + body],
                               capture_output=True, text=True)
+
+    def extract_function(self, name):
+        """从 install.sh 里取出一个顶层函数定义。
+
+        按缩进判定结束：顶层 ``}`` 之后的第一行若不以空白或 ``}`` 开头，函数即
+        结束。这种写法会在函数体含 here-doc 时出错——here-doc 正文可能顶格出现
+        ``}``，被误判为函数结尾。所以先扫出函数体内的 here-doc 区间，落在区间
+        内的行不参与结束判定。
+        """
+        import re
+        source = SCRIPT.read_text()
+        start = source.index(f"{name}() {{")
+        lines = source[start:].splitlines()
+        heredocs = []  # 待匹配的 here-doc 结束标记
+        for index, line in enumerate(lines):
+            if index and not heredocs and line.startswith("}") and line != "}":
+                continue
+            if index and not heredocs and line == "}":
+                return "\n".join(lines[: index + 1]) + "\n"
+            # <<、<<-、<<'EOF'、<<"EOF" 形式；只跟踪标记本身，正文原样跳过。
+            for match in re.finditer(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line):
+                heredocs.append(match.group(2))
+            if heredocs and line.strip() == heredocs[0]:
+                heredocs.pop(0)
+        raise AssertionError(f"missing testable function {name}")
+
+    def test_long_waits_report_progress(self):
+        """下载/编译期间必须有进度输出。
+
+        用户反复以为"卡住了"然后中断安装，比安装真的失败更伤。凡是能等几十秒
+        以上的步骤都要起 ticker，并写明已等待多久。
+        """
+        source = SCRIPT.read_text()
+        for helper in ("progress_start()", "progress_stop()"):
+            self.assertIn(helper, source)
+        # 只认顶层函数定义，避免把注释里的名字当实现。
+        self.assertIn("\nprogress_start() {", source)
+        self.assertIn("\nprogress_stop() {", source)
+
+        # 这些是实际会长时间无输出的点，每处都必须配对 start/stop。
+        for label, scope in [("预编译下载", ("download_prebuilt() {", "\n}\n", "progress_start")),
+                             ("编译", ("plan_build_parallelism", "log \"编译完成", "progress_start")),
+                             ("源码克隆", ("elif download_prebuilt; then", "GO_VERSION=$(awk", "progress_start"))]:
+            begin = source.index(scope[0])
+            end = source.index(scope[1], begin)
+            self.assertIn("progress_start", source[begin:end], f"{label} 缺少进度输出")
+        # 每个 start 都要有 stop 兜底，否则 ticker 会在后续输出里继续插行。
+        # stop 可以多于 start（例如"成功路径 stop 一次、失败路径再 stop 一次"
+        # 是幂等的），但绝不能少于 start——少一个就会留下野 ticker。
+        def call_sites(name):
+            pattern = re.compile(r"^[ \t]*" + name + r"[ \t]+[^-]|^[ \t]*" + name + r"[ \t]*$", re.M)
+            return [m.group(0) for m in pattern.finditer(source) if "() {" not in m.group(0)]
+        starts, stops = call_sites("progress_start"), call_sites("progress_stop")
+        self.assertGreaterEqual(len(stops), len(starts),
+                                f"stop 少于 start，会留下野 ticker：start={len(starts)} stop={len(stops)}")
+        self.assertGreaterEqual(len(starts), 4, "长等待步骤的进度打点太少")
+
+        # ticker 只在 stderr 是终端时启用；重定向到日志文件时不该被噪声淹没。
+        definition = self.extract_function('progress_start') + "\n" + self.extract_function('progress_stop')
+        body = ("progress_supported() { return 0; }; "
+                "progress_start '测试中' 1; sleep 2; progress_stop; echo stopped")
+        result = subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + definition + "\n" + body],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("测试中", result.stderr)
+        self.assertIn("已等待", result.stderr)
+        self.assertIn("stopped", result.stdout)
+
+        # 非终端（重定向）时不打点。
+        quiet = subprocess.run(
+            ["bash", "-c", "set -Eeuo pipefail\n" + definition + "\n"
+             "progress_supported() { return 1; }; progress_start 'quiet' 1; sleep 1; progress_stop; echo done"],
+            capture_output=True, text=True)
+        self.assertEqual(quiet.returncode, 0, quiet.stderr)
+        self.assertNotIn("quiet", quiet.stderr)
+
+    def test_shared_progress_ticker_is_replaced(self):
+        """连开两次 progress_start 不能留下两个 ticker。"""
+        body = ("progress_supported() { return 0; }; "
+                "progress_start 'first' 1; progress_start 'second' 1; sleep 2; "
+                "[[ -n $PROGRESS_PID ]] || { echo 'PID 丢失'; exit 9; }; "
+                "progress_stop; [[ -z $PROGRESS_PID ]] || { echo '未清空'; exit 8; }; echo ok")
+        definition = self.extract_function('progress_start') + "\n" + self.extract_function('progress_stop')
+        result = subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + definition + "\n" + body],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+        self.assertIn("second", result.stderr)
+        self.assertNotIn("first", result.stderr)
 
     def test_permission_denied_state_explains_sudo(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -292,11 +380,33 @@ class InstallerCLI(unittest.TestCase):
     def test_dns_resolution_and_ipv6_notice(self):
         source = SCRIPT.read_text()
         self.assertIn('socket.getaddrinfo', source)
+        # 取不到本机公网 IP 时必须跳过比对而不是拦人——多宿主/CDN/NAT 环境下
+        # 「解析 IP != 本机网卡 IP」是正常状态，硬拦会误伤可用环境。
+        no_ip = ('DOMAIN=gift.example.com; python3() { printf "%s\\n" 192.0.2.1; }; '
+                 'local_public_ips() { return 0; }; log() { printf "%s\\n" "$*" >&2; }; '
+                 'die() { printf "%s\\n" "$*" >&2; exit 7; }; check_dns')
+        result = self.run_function('check_dns', no_ip)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('跳过', result.stderr)
         for answer, expected in [('192.0.2.1', 0), ('2001:db8::1', 0), ('', 7)]:
-            result = self.run_function('check_dns', f'DOMAIN=gift.example.com; python3() {{ printf "%s\\n" {shlex.quote(answer)}; }}; log() {{ printf "%s\\n" "$*" >&2; }}; die() {{ printf "%s\\n" "$*" >&2; exit 7; }}; check_dns')
+            probe = (f'DOMAIN=gift.example.com; python3() {{ printf "%s\\n" {shlex.quote(answer)}; }}; '
+                     'local_public_ips() { printf "%s\\n" 192.0.2.1; }; '
+                     'log() { printf "%s\\n" "$*" >&2; }; '
+                     'die() { printf "%s\\n" "$*" >&2; exit 7; }; check_dns')
+            result = self.run_function('check_dns', probe)
             self.assertEqual(result.returncode, expected, result.stderr)
             if ':' in answer:
                 self.assertIn('IPv6', result.stderr)
+        # 解析地址与本机不符时只警告，不能中断安装。
+        mismatch = ('DOMAIN=gift.example.com; python3() { printf "%s\\n" 203.0.113.9; }; '
+                    'local_public_ips() { printf "%s\\n" 198.51.100.7; }; '
+                    'log() { printf "%s\\n" "$*" >&2; }; '
+                    'die() { printf "%s\\n" "$*" >&2; exit 7; }; check_dns')
+        result = self.run_function('check_dns', mismatch)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('警告', result.stderr)
+        self.assertIn('203.0.113.9', result.stderr)
+        self.assertIn('198.51.100.7', result.stderr)
         self.assertLess(source.index('check_dns\n', source.index('OWNERS=$(ss')), source.index('GO_VERSION=$(awk'))
 
     def test_external_blocks_and_unknown_listener_confirmation(self):
@@ -395,28 +505,31 @@ class InstallerCLI(unittest.TestCase):
         self.assertIn("--jobs", result.stderr)
 
     def test_goproxy_probes_before_choosing(self):
-        """不能无条件用国内镜像：同一台美国机器上 goproxy.cn 比默认慢 19 倍。"""
+        """不能无条件用国内镜像：同一台美国机器上 goproxy.cn 比默认慢 19 倍。
+
+        探测必须验证「完整下载成功」，而不只是量首字节延迟——实测遇到过
+        延迟 0.1s 但下到一半断流的源，那种情况下安装会卡在半路。
+        """
         source = SCRIPT.read_text()
         self.assertIn("goproxy.cn", source)
         self.assertIn("proxy.golang.org", source)
         self.assertIn("time_total", source)
+        # 探测要限时，否则一个吊死的代理会让安装停在这里。
+        self.assertIn("--connect-timeout", source)
 
         def run(env, override=None, default_time=None, cn_time=None):
             # curl is shadowed so each candidate can be given a synthetic latency.
-            # The stub prints the mapped latency for a known host and fails the rest.
-            mapping = []
-            if default_time is not None:
-                mapping.append(f'"proxy.golang.org" {default_time}')
-            if cn_time is not None:
-                mapping.append(f'"goproxy.cn" {cn_time}')
-            stub = "curl() { local u=${@: -1}; "
+            # 探测函数 probe_go_proxy 是独立顶层函数，不在 setup_go_proxy 的
+            # 抽取范围内，所以这里直接 shadow 它：成功时回显耗时，失败时非零。
+            stub = "probe_go_proxy() { case \"$1\" in "
             for needle, value in [("proxy.golang.org", default_time), ("goproxy.cn", cn_time)]:
                 if value is not None:
-                    stub += f'case "$u" in *{needle}*) echo {value}; return 0;; esac; '
-            stub += "return 1; }; "
-            body = (f"GOPROXY={env}; log() {{ :; }}; "
+                    stub += f'*{needle}*) echo {value}; return 0;; '
+            stub += "esac; return 1; }; "
+            body = (f"GOPROXY={env}; log() {{ :; }}; GOPROXY_PROBES_STUB=1; "
                     + (f"GOPROXY_OVERRIDE={override!r}; " if override is not None else "GOPROXY_OVERRIDE=; ")
                     + stub
+                    + "GO_PROXY_PROBES=('https://proxy.golang.org|x' 'https://goproxy.cn|x'); "
                     + "setup_go_proxy; echo \"proxy=${GOPROXY:-<unset>}\"")
             return self.run_function('setup_go_proxy', body)
 
@@ -425,34 +538,41 @@ class InstallerCLI(unittest.TestCase):
         self.assertEqual(fast.returncode, 0, fast.stderr)
         self.assertIn("proxy=https://proxy.golang.org,direct", fast.stdout)
 
-        # 默认线路慢（国内常见）：切到 goproxy.cn 完整链，不走单点。
+        # 默认线路慢（国内常见）：切到 goproxy.cn，不走单点。
         slow_default = run("''", default_time="9.0", cn_time="0.46")
         self.assertEqual(slow_default.returncode, 0, slow_default.stderr)
         self.assertIn("proxy=https://goproxy.cn,direct", slow_default.stdout)
 
-        # 两个代理都慢：走国内镜像链并保留 goproxy.io 兜底。
+        # 两个都慢也仍然选实测更快的那条，同时保留 direct 兜底。
         all_slow = run("''", default_time="9.0", cn_time="4.0")
-        self.assertIn("proxy=https://goproxy.cn,https://goproxy.io,direct", all_slow.stdout)
+        self.assertIn("proxy=https://goproxy.cn,direct", all_slow.stdout)
 
         # 只有国内镜像可达：也要能切过去。
         cn_only = run("''", cn_time="0.46")
         self.assertIn("proxy=https://goproxy.cn,direct", cn_only.stdout)
 
-        # 两个都失败：退回直连并给出可操作提示，而不是硬编码一个连不上的代理。
+        # 探测未完成（curl 失败）的源不能因为"延迟低"被选中。
+        # 这里 default 与 cn 都探测失败，应退回直连而不是硬编码某个代理。
         neither = run("''")
         self.assertEqual(neither.returncode, 0, neither.stderr)
         self.assertIn("proxy=direct", neither.stdout)
 
+        # --goproxy off 必须禁用代理走直连；显式 --goproxy URL 必须原样生效。
+        off = run("'https://ignored.example'", override="off", default_time="0.1")
+        # --goproxy off 必须真正关闭代理：环境里的 GOPROXY 也不能漏网。
+        # 旧实现只"不设置"，继承来的值照样生效，用户要求直连却被走了代理。
+        off = run("https://ignored.example", override="off", default_time="0.1")
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertNotIn("ignored.example", off.stdout)
+
+        # 显式 --goproxy URL 原样生效，且不触发探测。
+        explicit = run("''", override="https://goproxy.cn", default_time="9.0")
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertIn("proxy=https://goproxy.cn", explicit.stdout)
+
         # 用户已设置 GOPROXY 时不得覆盖。
         keep = run("https://internal.example/proxy", default_time="9.0", cn_time="0.46")
         self.assertIn("proxy=https://internal.example/proxy", keep.stdout)
-        # 显式 off 关闭镜像：不导出 GOPROXY，让 Go 用 direct 默认值。
-        off = run("''", "off", default_time="9.0")
-        self.assertEqual(off.returncode, 0, off.stderr)
-        self.assertIn("proxy=<unset>", off.stdout)
-        # 显式自定义生效，且不触发探测。
-        custom = run("''", "https://goproxy.io,direct", default_time="9.0")
-        self.assertIn("proxy=https://goproxy.io,direct", custom.stdout)
 
     def test_build_flags_are_documented_and_forwarded(self):
         source = SCRIPT.read_text()

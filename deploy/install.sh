@@ -14,6 +14,35 @@ SELF=$(realpath "${BASH_SOURCE[0]}")
 if [[ -f "$(dirname "$SELF")/install.conf" ]]; then ROOT=$(dirname "$SELF"); fi
 log() { printf '%s\n' "$*" >&2; }
 die() { log "错误：$*"; exit 1; }
+# 进度显示。下载 60 MB 二进制、拉几百个 Go 模块、编译链接都可能几分钟没有
+# 输出，用户会以为卡死然后 Ctrl-C——这比真的失败更伤。所以凡是能等的步骤都
+# 起一个 ticker 在 stderr 打点，并写明已等待多久，让人知道程序还活着。
+# 只在 stderr 是终端时打点：重定向到文件时不该被日志噪声淹没。
+PROGRESS_PID=
+progress_supported() { [[ -t 2 ]]; }
+# progress_start <说明> [间隔秒]：起一个后台 ticker 在 stderr 打点。
+progress_start() {
+  local label=$1 every=${2:-15} start=0
+  progress_stop
+  progress_supported || return 0
+  (
+    while :; do
+      sleep "$every"
+      start=$((start + every))
+      printf '  [进行中] %s（已等待 %ds）\n' "$label" "$start" >&2
+    done
+  ) &
+  PROGRESS_PID=$!
+}
+# 无论成功失败都调用 progress_stop，否则 ticker 会在后续输出里继续插行。
+progress_stop() {
+  # 用 ${PROGRESS_PID:-} 而不是 $PROGRESS_PID：这个函数会被当清道夫调用，
+  # 可能在 start 之前就触发；set -u 下裸引用会直接报错。
+  [[ -n ${PROGRESS_PID:-} ]] || return 0
+  kill "$PROGRESS_PID" 2>/dev/null || true
+  wait "$PROGRESS_PID" 2>/dev/null || true
+  PROGRESS_PID=
+}
 usage() {
   cat <<'HELP'
 XGift 交互式安装器（Debian/Ubuntu + systemd，amd64/arm64）
@@ -188,8 +217,49 @@ nginx_domain_conflict() {
     }
   ' <<< "$dump"
 }
+# 本机全部公网 IP，用于判断「域名到底有没有指向这台机器」。
+local_public_ips() {
+  python3 - <<'PY' 2>/dev/null || true
+import ipaddress, socket, subprocess
+found = set()
+try:
+    out = subprocess.run(["ip", "-o", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+except Exception:
+    out = ""
+for line in out.splitlines():
+    parts = line.split()
+    if len(parts) < 4:
+        continue
+    addr = parts[3].split("/")[0]
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        continue
+    if ip.version == 4 and not (ip.is_private or ip.is_loopback or ip.is_link_local):
+        found.add(str(ip))
+for host in ("169.254.169.254",):
+    # 云厂商元数据里的公网 IP；失败就跳过，不阻塞安装。
+    pass
+try:
+    # 出口 IP 也算：NAT 或弹性 IP 场景下网卡上看不到公网地址。
+    out = subprocess.run(
+        ["curl", "-fsS", "--max-time", "6", "https://api.ipify.org"],
+        capture_output=True, text=True, timeout=10).stdout.strip()
+    if out:
+        ipaddress.ip_address(out)
+        found.add(out)
+except Exception:
+    pass
+print("\n".join(sorted(found)))
+PY
+}
+# 这里只做两件事：确认域名能解析，以及（尽力而为地）确认它指向本机。
+# 校验失败一律给警告不拦人——多宿主、CDN、Anycast、NAT、IPv6-only 都可能让
+# 「解析出的 IP 不等于本机网卡 IP」成为正常状态，硬拦会误伤真实可用环境。
+# 但必须在这里说清楚：真正的 HTTPS 检查在几分钟之后，错误留到那时才暴露，
+# 用户已经白等一轮。
 check_dns() {
-  local addresses
+  local addresses local_ips hit=0 ip
   addresses=$(python3 -c 'import socket,sys
 try:
     addresses=sorted({item[4][0] for item in socket.getaddrinfo(sys.argv[1],443,type=socket.SOCK_STREAM)})
@@ -201,6 +271,26 @@ except OSError as error:
   log "DNS 解析结果：$addresses"
   if [[ $addresses == *:* ]]; then
     log '检测到 AAAA/IPv6：请确认上述 IPv6 对应本机，且本机 IPv6 入站 80/443 与反代监听可达；错误 AAAA 会导致证书或 HTTPS 失败。不会自动修改 DNS、防火墙或 CDN。'
+  fi
+  # 尽力而为的本机比对。取不到本机 IP 就不下结论，只跳过检查。
+  local_ips=$(local_public_ips)
+  if [[ -z $local_ips ]]; then
+    log '提示：未能取得本机公网 IP，跳过「域名是否指向本机」的核对；若稍后 HTTPS 失败请优先检查 DNS。'
+    return 0
+  fi
+  while IFS= read -r ip; do
+    [[ -n $ip ]] || continue
+    if grep -qxF "$ip" <<< "$local_ips"; then hit=1; break; fi
+  done <<< "$addresses"
+  if ((hit)); then
+    log 'DNS 指向核对：解析地址与本机公网 IP 匹配。'
+  else
+    log '警告：域名解析出的地址与本机公网 IP 都不一致。'
+    log "  解析得到：$(tr '\n' ' ' <<< "$addresses")"
+    log "  本机公网：$(tr '\n' ' ' <<< "$local_ips")"
+    log '  若使用 CDN、多台服务器、IPv6 或云负载均衡，这是正常的，可以继续。'
+    log '  若不是，安装会在最后一步「公网 HTTPS 健康检查」失败并自动回滚——与其等几分钟，'
+    log '  建议现在先停下去修 DNS，改完再重跑这条命令。'
   fi
 }
 choose_external() {
@@ -266,6 +356,7 @@ download_prebuilt() {
   esac
   base="https://github.com/$REPO/releases/download/$REF"
   tmp=$(mktemp -d)
+  log "正在从 GitHub Release 下载预编译程序（$REF，约 60 MB × 2）。"
   # 任一分支退出都要清掉临时目录，避免半下载的二进制留在磁盘上。
   if ! curl -fSL --retry 2 --retry-max-time 300 --connect-timeout 15 --max-time 300 \
        "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
@@ -278,11 +369,14 @@ download_prebuilt() {
       log "提示：校验清单里没有 $name-linux-$arch 的记录，将改为在目标机编译"
       rm -rf -- "$tmp"; return 1
     fi
+    progress_start "下载 $name-linux-$arch（约 60 MB）" 15
     if ! curl -fSL --retry 2 --retry-max-time 600 --connect-timeout 15 --max-time 600 \
          "$base/$name-linux-$arch" -o "$tmp/$name" 2>/dev/null; then
+      progress_stop
       log "提示：下载 $name-linux-$arch 失败，将改为在目标机编译"
       rm -rf -- "$tmp"; return 1
     fi
+    progress_stop
     got=$(sha256sum "$tmp/$name" | awk '{print $1}')
     if [[ $got != "$want" ]]; then
       # 明确区分「下载坏了」和「被篡改」：后者要立刻停下让人看见。
@@ -336,31 +430,64 @@ plan_build_parallelism() {
 # 但国内线路访问 proxy.golang.org 会退化到逐个模块串行等待，sing-box 依赖树
 # 有几百个模块（含 QUIC、Caddy server、chromium 内核），拖到几十分钟很常见。
 # 所以先各测一次连通性，再选快的那条；两个都通但都不快就退回默认链。
+# 只测首字节延迟是不够的：实测遇到过「延迟 0.1s 但下到一半断流」的源，
+# 结果安装卡在半路，比一开始就慢更糟。所以探测两件事：
+#   1) 一个小体积、真实存在的模块元数据能否**完整**下完（不只看 TTFB）；
+#   2) 下完的耗时。
+# 两个都通过才参与比较。都不通过就直连，并在提示里给出显式选项。
+GO_PROXY_PROBES=(
+  'https://proxy.golang.org|github.com/quic-go/quic-go/@v/list'
+  'https://goproxy.cn|github.com/quic-go/quic-go/@v/list'
+  'https://goproxy.io|github.com/quic-go/quic-go/@v/list'
+)
+probe_go_proxy() {
+  # 输出 "<耗时秒>" 表示可用；无输出表示不可用。判据是「整体传输成功」。
+  local url path body
+  url=${1%%|*}; path=${1#*|}
+  curl -fsS --max-time 12 --connect-timeout 6 \
+    -o /dev/null -w '%{time_total}' "$url/$path" 2>/dev/null || return 1
+}
 setup_go_proxy() {
   if [[ -n ${GOPROXY_OVERRIDE:-} ]]; then
-    if [[ $GOPROXY_OVERRIDE != off ]]; then export GOPROXY="$GOPROXY_OVERRIDE"; fi
+    # off 明确要求直连：这里必须 unset。只"不设置"是不够的——环境或已保存
+    # 的 GOPROXY 仍然生效，用户要求直连却被悄悄走了代理。
+    if [[ $GOPROXY_OVERRIDE == off ]]; then
+      unset GOPROXY
+      log 'Go 模块代理：按 --goproxy off 直连（不使用任何模块代理）。'
+    else
+      export GOPROXY="$GOPROXY_OVERRIDE"
+      log "Go 模块代理：$GOPROXY（由 --goproxy 指定）"
+    fi
     return 0
   fi
   # 用户已设置则保留原值。用 if 而非 `[[ ]] || return`：后者在 set -e 下
   # 条件为假时会让整个函数以非零状态退出，安装随之中断。
-  if [[ -n ${GOPROXY:-} ]]; then return 0; fi
-  local probe url fastest= best=
-  for url in 'https://proxy.golang.org' 'https://goproxy.cn'; do
-    probe=$(curl -fsS --max-time 8 -o /dev/null -w '%{time_total}' \
-      "$url/github.com/quic-go/quic-go/@v/list" 2>/dev/null || echo '')
-    if [[ -n $probe ]] && { [[ -z $fastest ]] || awk "BEGIN{exit !($probe < $fastest)}"; }; then
-      fastest=$probe; best=$url
+  if [[ -n ${GOPROXY:-} ]]; then
+    log "Go 模块代理：沿用环境中的 GOPROXY=$GOPROXY"
+    return 0
+  fi
+  log '正在探测 Go 模块代理（比较完整下载小文件的实际耗时，而不只是延迟）。'
+  local entry probe fastest= best= failed=()
+  for entry in "${GO_PROXY_PROBES[@]}"; do
+    if probe=$(probe_go_proxy "$entry"); then
+      log "  ${entry%%|*} 可用，耗时 ${probe}s"
+      if [[ -z $fastest ]] || awk "BEGIN{exit !($probe < $fastest)}"; then
+        fastest=$probe; best=${entry%%|*}
+      fi
+    else
+      log "  ${entry%%|*} 不可用（连接失败或传输未完成）"
+      failed+=("${entry%%|*}")
     fi
   done
   if [[ -z $best ]]; then
     export GOPROXY='direct'
-    log '提示：两个 Go 模块代理都探测失败，已改为直连；如下载变慢可加 --goproxy https://goproxy.cn'
-  elif awk "BEGIN{exit !($fastest > 0.8)}"; then
-    export GOPROXY='https://goproxy.cn,https://goproxy.io,direct'
-    log "Go 模块代理：goproxy.cn → goproxy.io → 直连（默认线路实测 ${fastest}s，偏慢）"
+    log '提示：所有 Go 模块代理都探测失败，已改为直连。'
+    log '      若编译或下载在直连下变慢/失败，可用 --goproxy https://goproxy.cn 指定。'
   else
+    # 首选探测通过的，其余按顺序兜底。Go 自身在某个代理返回错误时会
+    # 自动尝试列表里的下一个，所以把失败过的留在末尾没有坏处。
     export GOPROXY="$best,direct"
-    log "Go 模块代理：${best}（实测 ${fastest}s）"
+    log "Go 模块代理：$best → 直连（实测完整下载 ${fastest}s）"
   fi
 }
 rollback() {
@@ -566,10 +693,16 @@ if ((PREBUILT == 0 && DRY == 0)); then
     mkdir "$TMP/src"
     cp -a "$SOURCE_DIR/." "$TMP/src/"
   else
+    log "正在获取源码（$REPO @ $REF）。"
     for attempt in 1 2 3; do
-      if timeout 300 git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$TMP/src"; then break; fi
+      progress_start "克隆源码（第 $attempt/3 次尝试）" 20
+      if timeout 300 git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$TMP/src"; then
+        progress_stop; break
+      fi
+      progress_stop
       rm -rf -- "$TMP/src"
       ((attempt < 3)) || die '源码下载失败（3 次，单次限时 300 秒）；检查 GitHub 连通性或使用 --source-dir'
+      log "第 $attempt 次源码下载失败，稍后重试。"
     done
   fi
   GO_VERSION=$(awk '$1=="go" {gsub(/\r/,"",$2); print $2; exit}' "$TMP/src/go.mod")
@@ -577,13 +710,17 @@ if ((PREBUILT == 0 && DRY == 0)); then
   case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) die '仅支持 amd64/arm64';; esac
   GO_HOME="$ROOT/toolchains/go$GO_VERSION"
   if [[ ! -x $GO_HOME/bin/go ]]; then
+    log "正在下载 Go 工具链 go$GO_VERSION（约 70 MB）。"
+    progress_start "下载 Go 工具链 go$GO_VERSION" 15
     curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 'https://go.dev/dl/?mode=json&include=all' -o "$TMP/go.json"
     SHA=$(python3 -c 'import json,sys; vs=json.load(open(sys.argv[1])); fs=[f for v in vs if v["version"]==sys.argv[2] for f in v["files"] if f["filename"]==sys.argv[3]]; assert len(fs)==1,"Go archive unavailable"; print(fs[0]["sha256"])' "$TMP/go.json" "go$GO_VERSION" "go$GO_VERSION.linux-$ARCH.tar.gz")
     curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 "https://go.dev/dl/go$GO_VERSION.linux-$ARCH.tar.gz" -o "$TMP/go.tar.gz"
+    progress_stop
     printf '%s  %s\n' "$SHA" "$TMP/go.tar.gz" | sha256sum -c -
     mkdir -p "$ROOT/toolchains"
     tar -xzf "$TMP/go.tar.gz" -C "$TMP"
     mv "$TMP/go" "$GO_HOME"
+    log "Go 工具链已就位：$GO_HOME"
   fi
   export PATH="$GO_HOME/bin:$PATH" CGO_ENABLED=1
   # Parallelism and module proxy are chosen for the machine, not fixed at the
@@ -592,10 +729,21 @@ if ((PREBUILT == 0 && DRY == 0)); then
   setup_go_proxy
   export GOPATH="$ROOT/build-cache/gopath" GOCACHE="$ROOT/build-cache/go-build"
   mkdir "$TMP/bin"
-  log "开始编译（首次安装需拉取 sing-box 依赖树，耗时取决于网络；进度见下方 go downloading 输出）"
+  if [[ -n $SOURCE_DIR ]]; then
+    log '开始编译（本地源码，无需拉取依赖时可更快）。'
+  else
+    log '开始编译。首次安装要下载 sing-box 依赖树（几百个模块），随后编译链接；'
+    log '全程几分钟到十几分钟，且可能长时间只有零星输出——这是正常的，不是卡死。'
+  fi
   START_BUILD=$(date +%s)
-  (cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
-  log "编译完成，用时 $(( $(date +%s) - START_BUILD )) 秒"
+  progress_start '编译中（下载依赖 + 编译链接）' 20
+  # 分两步编译：先 xgift CLI 再 Web 服务。用户看到的 go downloading 输出是第
+  # 一步在拉依赖，第二次编译会复用构建缓存，明显快得多。
+  (cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift)
+  log "已编译 xgift，用时 $(( $(date +%s) - START_BUILD )) 秒；继续编译 Web 服务。"
+  (cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
+  progress_stop
+  log "编译完成，总用时 $(( $(date +%s) - START_BUILD )) 秒"
 fi
 # 部署资产落地。编译路径从 $TMP/src/deploy 取，预编译路径没有源码目录，
 # 改为下载与编译器同一个 tag 的 deploy/*（此时 $REF 已在 download_prebuilt
@@ -647,7 +795,13 @@ for name in install.conf install.sh; do [[ ! -f $ROOT/$name ]] || cp "$ROOT/$nam
 [[ ! -f $NGINX_FILE ]] || cp "$NGINX_FILE" "$BACKUP/nginx"
 systemctl is-active --quiet xgift && HAD_SERVICE=1 || true
 CHANGED=1
-systemctl stop xgift || true
+# 首次安装时服务还不存在，systemctl stop 会打印一条红色 "Unit ... not loaded."
+# 让用户以为装挂了。这不是错误：只要不是「正在运行却没停下来」就继续。
+if [[ -f /etc/systemd/system/xgift.service ]] || [[ $HAD_SERVICE == 1 ]]; then
+  systemctl stop xgift || true
+else
+  log '（首次安装，无需停止已有服务。）'
+fi
 id xgift >/dev/null 2>&1 || useradd --system --home-dir "$ROOT" --shell /usr/sbin/nologin xgift
 install -d -m 700 -o xgift -g xgift "$ROOT/data" "$ROOT/secrets"
 for name in vault-password setup-password; do
@@ -675,12 +829,17 @@ install -m 600 "$TMP/env" "$ROOT/site.env"
 sed -e "s|/opt/xgift|$ROOT|g" -e "s|/etc/xgift/site.env|$ROOT/site.env|" -e "s|/var/lib/xgift|$ROOT/data $ROOT/secrets|" "$TMP_ASSETS/xgift.service" > /etc/systemd/system/xgift.service
 systemctl daemon-reload
 systemctl enable --now xgift
+log "服务已启动，正在等待本机健康检查（127.0.0.1:$PORT/healthz）。"
 healthy=0
+# -s -S 让失败时也不要吐 "Failed to connect ... Couldn't connect to server"。
+# 刚 enable --now 的瞬间进程还没绑上端口，第一次探测必然失败，那是正常的；
+# 但这条红色 curl 报错会被当成"装挂了"，所以整体静音，只在最终失败时才解释。
 for ((i=0;i<30;i++)); do
-  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null; then healthy=1; break; fi
+  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then healthy=1; break; fi
   sleep 2
 done
 ((healthy)) || { journalctl -u xgift -n 30 --no-pager >&2; die '服务未通过健康检查'; }
+log '本机健康检查通过。'
 if [[ $MODE == caddy ]]; then
   cp "$CADDY_STAGE" /etc/caddy/Caddyfile
   systemctl enable --now caddy
@@ -727,12 +886,31 @@ NGINX
   systemctl enable --now certbot.timer
 fi
 if [[ $MODE != external ]]; then
+  log "正在等待公网 HTTPS 生效：https://$DOMAIN/healthz（签发证书 + 反代就绪通常要 10–30 秒）。"
   tls_ok=0
+  # 同样静音中间失败：这一步本来就要重试几十秒，把每次失败都打出来只会淹没
+  # 关键信息。真正的诊断在下面统一输出一次。
   for ((i=0;i<30;i++)); do
-    if curl -fsS --max-time 8 "https://$DOMAIN/healthz" >/dev/null; then tls_ok=1; break; fi
+    if curl -fsS --max-time 8 "https://$DOMAIN/healthz" >/dev/null 2>&1; then tls_ok=1; break; fi
     sleep 2
   done
-  ((tls_ok)) || die '公网 HTTPS 健康检查失败：检查 DNS、云安全组 80/443、AAAA 记录及 CDN 回源；已触发程序/配置回滚'
+  if ((tls_ok)); then
+    log '公网 HTTPS 健康检查通过。'
+  else
+    # 把最后一条 curl 的真实错误打出来。只说"检查 DNS"没有用——用户看到的
+    # 是"DNS 我明明指对了"，真正的原因可能是证书签发失败、安全组没开、
+    # AAAA 记录指向别处，或者 CDN 回源打不通。
+    tls_err=$(curl -sS -o /dev/null --max-time 8 "https://$DOMAIN/healthz" 2>&1 || true)
+    log '公网 HTTPS 健康检查失败，诊断如下：'
+    log "  curl 报错：${tls_err:-（无输出）}"
+    log "  域名解析：$(python3 -c 'import socket,sys;print(",".join(sorted({i[4][0] for i in socket.getaddrinfo(sys.argv[1],443,type=socket.SOCK_STREAM)})))' "$DOMAIN" 2>/dev/null || echo '解析失败')"
+    log "  本机公网：$(local_public_ips | tr '\n' ' ')"
+    [[ $MODE == caddy ]] && log '  Caddy 状态：' && systemctl is-active caddy 2>&1 | sed 's/^/    /'
+    [[ $MODE == nginx ]] && log '  Nginx 状态：' && systemctl is-active nginx 2>&1 | sed 's/^/    /'
+    log '  常见原因：DNS 未生效或指向别的机器、云安全组未放行 80/443、'
+    log '            存在指向错误地址的 AAAA(IPv6) 记录、CDN 回源配置不对。'
+    die '公网 HTTPS 健康检查失败；已触发程序/配置回滚'
+  fi
 fi
 # Publish both files only after staging succeeds; rollback restores both on failure.
 install -m 700 "$TMP_ASSETS/install.sh" "$TMP/install.sh"
