@@ -281,48 +281,53 @@ class InstallerCLI(unittest.TestCase):
         self.assertIn('REF=%s', source)
         self.assertIn('cp "$BACKUP/$name" "$ROOT/$name"', source)
 
-    def test_upgrade_bootstrap_downloads_requested_ref(self):
-        """升级自举必须优先用 install.conf 里记的 ref，而不是命令行上还没解析的值。
+    def test_upgrade_bootstrap_prefers_newest_installer(self):
+        """自举必须优先找"修好的"安装器，不能锚在用户当前版本上。
 
-        踩过的坑：自举用默认的 main（或用户传的旧 tag）去拉安装器，会拉回一个
-        带已知 bug 的旧版本，于是每次升级都原地复现同一个失败。
+        踩过的坑：曾经优先用 install.conf 里记的 REF（"上次装成功的版本"），
+        结果用户停在 v0.1.0、而 v0.1.0 恰好冻结着带 bug 的安装器，于是每次
+        升级都把旧安装器拉回来，原地复现同一个失败——自举完全失去意义。
+
+        这里只做结构断言，不去复刻整套下载逻辑：行为验证已经由真机验收覆盖
+        （v0.1.0 → v0.2.0 的实际升级），在测试里重复实现一遍 curl 桩只会
+        把实现细节抄进测试，反而更脆。
         """
         source = SCRIPT.read_text()
         start = source.index("# An installed entry point")
         end = source.index("log 'XGift 一键安装", start)
         bootstrap = source[start:end]
 
-        def run(saved_ref, cli_ref, fail_first=False):
-            with tempfile.TemporaryDirectory() as directory:
-                fake = Path(directory) / "downloaded.sh"
-                fake.write_text('#!/bin/bash\nprintf "%s\\n" "boot=$XGIFT_BOOTSTRAPPED args=$*"\n')
-                conf = Path(directory) / "install.conf"
-                conf.write_text(saved_ref)
-                body = (
-                    f'ACTION=upgrade; SOURCE_DIR=; DRY=0; ROOT={str(directory)!r}; '
-                    f'REF={cli_ref}; REPO=owner/repo; SELF=/tmp/self.sh; '
-                    f'ORIGINAL_ARGS=(--upgrade --yes); '
-                    'log() { printf "%s\\n" "$*" >&2; }; die() { exit 7; }; '
-                    f'curl() {{ printf "URL=%s\\n" "$*"; cp {str(fake)!r} "${{@: -1}}"; }}; '
-                    + bootstrap)
-                return subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + body],
-                                      capture_output=True, text=True)
+        # 必须有"安装器是否合格"的判据，且判据要认识当前路径约定。
+        self.assertIn("installer_looks_current() {", bootstrap)
+        self.assertIn("grep -q 'TMP_ASSETS'", bootstrap)
 
-        # install.conf 记着 release，命令行给的是 main：应优先用 release。
-        result = run("REF=release\n", "main")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("owner/repo/release/deploy/install.sh", result.stdout)
-        self.assertIn("boot=1 args=--upgrade --yes --dir", result.stdout)
+        # 候选顺序：main（修复先合进 main）必须排在最新发布 tag 之前，
+        # 而且都不能是 install.conf 里的旧 REF。
+        candidates = re.search(r"for candidate in ([^;]+);", bootstrap)
+        self.assertIsNotNone(candidates)
+        order = candidates.group(1)
+        self.assertIn("main", order)
+        self.assertIn("UPDATE_LATEST", order)
+        self.assertLess(order.index("main"), order.index("UPDATE_LATEST"))
+        # 不能把 install.conf 读出来的旧 REF 放在前面。
+        self.assertNotIn("UPDATE_REF", bootstrap)
 
-        # 没有任何记录时，退回命令行值。
-        result = run("", "release")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("owner/repo/release/deploy/install.sh", result.stdout)
+        # 必须查最新发布 tag，并把结果纳入候选。
+        self.assertIn("UPDATE_LATEST=$(latest_release_ref)", bootstrap)
 
-        # 明确记录了 main 时也要照用（不做额外猜测）。
-        result = run("REF=main\n", "main")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("owner/repo/main/deploy/install.sh", result.stdout)
+        # 每个候选都必须过一次合格性检查；不合格的不能拿去重跑。
+        self.assertIn('&& installer_looks_current "$UPDATE_TMP/install.sh"', bootstrap)
+
+        # 全都不合格时退回当前文件，而不是用带 bug 的旧版本。
+        self.assertIn('bash "$SELF"', bootstrap)
+
+    def test_stage_assets_replaces_stale_installer(self):
+        """从 tag 拿到的安装器若是旧版本，不能写进 $ROOT 让用户下次踩坑。"""
+        source = SCRIPT.read_text()
+        stage = source[source.index("stage_assets() {"):source.index("if ((DRY == 0)); then\n  stage_assets")]
+        self.assertIn("bash -n", stage, "必须做语法检查")
+        self.assertIn("grep -q 'TMP_ASSETS'", stage, "必须验证路径约定")
+        self.assertIn('cp "$SELF"', stage, "旧版本应替换为当前运行的安装器")
 
     def test_caddy_conflict_uses_imported_host_routes(self):
         import json

@@ -606,27 +606,28 @@ if [[ $ACTION == uninstall ]]; then
 fi
 # An installed entry point must pick up installer fixes before upgrading the application.
 #
-# 关键：升级前先自举一份新安装器再重跑。但下载地址里的 ref 必须**解析之后**的
-# 值——如果这里用还没解析的 $REF（例如默认的 main，或用户传的旧 tag），就会拉回
-# 一个旧安装器，而旧安装器可能带着已经修掉的 bug，于是每次升级都原地复现。
-# 所以这里优先用 install.conf 里记的 REF（那是上次真正装成功的版本），
-# 其次才是命令行值。
+# 自举的目的**就是拿到修好的安装器**，所以它必须去找最新的，绝不能锚在用户当前
+# 用的版本上。踩过的坑：曾经优先用 install.conf 里记的 REF（"上次装成功的版本"），
+# 结果用户停在 v0.1.0、而 v0.1.0 恰好冻结着带 bug 的安装器，于是每次升级都把
+# 旧安装器拉回来原地复现同一个失败——自举完全失去意义。
+#
+# 拉取顺序：main（修复总是先合进 main）→ 最新发布 tag → 用户当前 ref → 本地文件。
+# 只要能取到一份语法正确、且认识当前路径约定的安装器就重跑，否则用自己继续。
+installer_looks_current() {
+  local file=$1
+  bash -n "$file" 2>/dev/null || return 1
+  grep -q 'TMP_ASSETS' "$file"
+}
 if [[ $ACTION == upgrade && -z $SOURCE_DIR && $DRY == 0 && ${XGIFT_BOOTSTRAPPED:-0} != 1 ]]; then
   command -v curl >/dev/null || die '升级需要 curl'
-  UPDATE_REF=$REF
-  if [[ -f $ROOT/install.conf ]]; then
-    while IFS='=' read -r key value; do
-      case "$key" in REF) [[ -n $value ]] && UPDATE_REF=$value;; esac
-    done < "$ROOT/install.conf"
-  fi
   UPDATE_TMP=$(mktemp -d)
   trap 'rm -rf -- "$UPDATE_TMP"' EXIT
-  # 拉取顺序：先试自举 ref，失败再试 main（修复总是先合进 main）。
-  for candidate in "$UPDATE_REF" main; do
+  UPDATE_LATEST=$(latest_release_ref)
+  for candidate in main "$UPDATE_LATEST" "$REF"; do
     [[ -n $candidate ]] || continue
     if curl -fSL --retry 2 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
          "https://raw.githubusercontent.com/$REPO/$candidate/deploy/install.sh" -o "$UPDATE_TMP/install.sh" 2>/dev/null \
-       && bash -n "$UPDATE_TMP/install.sh" 2>/dev/null; then
+       && installer_looks_current "$UPDATE_TMP/install.sh"; then
       log "升级前已取得安装器（$candidate）。"
       XGIFT_BOOTSTRAPPED=1 bash "$UPDATE_TMP/install.sh" "${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"
       exit
