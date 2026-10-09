@@ -6,12 +6,12 @@ X（Twitter）Premium 礼品兑换平台。你生成兑换码发给用户，用�
 
 在兑换码站点的核心流程之上，重点补了三块**运维友好性**：
 
-**一、全程可在浏览器里配置，不需要 SSH**
+**一、业务配置在浏览器里完成**
 
-上游版本配置靠命令行，改一项就要登服务器。现在从首次安装到日常调整都能在网页完成：
+服务器部署、环境开关和备份仍需终端；初始化与日常业务调整不依赖 CLI 业务向导：
 
-- **首次运行向导**（`/setup`）：打开站点就有引导页，逐项填 X 凭据、支付卡、出站节点、商品价格，完成后自动生成站点配置和后台密码。**初始化完成后这个页面会自动关闭**，不会被后来者探测到。
-- **后台设置面板**：密码改完后仍可在「站点设置」随时调整，每个分区独立成页，不再需要命令行。
+- **首次初始化**（`/setup`）：验证部署时生成的初始化口令，只设置并确认管理员密码（32–256 UTF-8 字节，不允许首尾空白、换行或空字符）。不收集 X 凭据、支付卡、出站节点、商品价格。**保存后需重启服务；重启后初始化页面关闭**。
+- **后台设置面板**（`/admin`）：用户名固定为 `admin`，使用自己设置的密码登录；X 登录凭据、支付卡、商品与价格、付款出站和查询出口分别配置。域名、监听地址和自动付款开关由部署环境设置。
 - **粘贴整串 Cookie 自动拆分**：换 X 账号时不用逐个字段抄 `auth_token` 和 `ct0`，直接粘贴浏览器请求头原文、扩展导出的 JSON 数组、或含无关项的整段文本，会自动识别填入。
 
 **二、付款出站可在后台管理**
@@ -65,9 +65,50 @@ npm run preview
 
 ## 部署
 
-### 第一步：准备这些东西
+### 一条命令交互式安装（推荐）
 
-部署前请先准备好以下四样东西，配置向导会逐项询问：
+在**目标服务器**运行（Debian/Ubuntu、systemd、amd64/arm64），先把域名 DNS 指向该服务器：
+
+```sh
+curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main -o /tmp/xgift-install.sh && bash /tmp/xgift-install.sh
+```
+
+请以 root 登录执行；非 root 用户将最后的 `bash` 改成 `sudo bash`。下载失败时不会继续运行，也不会让下载管道占用交互输入。
+
+安装器询问域名和确认，自动安装编译依赖与匹配 `go.mod` 的 Go（官方 SHA256 校验，不替换系统 Go）、构建两个程序、配置 systemd 并生成保管库密码和初始化口令。默认自动选空闲本机端口（从 8787 起）。首次构建可能耗时较长；编译并行度与 Go 内存软限制不等于总内存上限，仍可能遇到 OOM、下载或编译失败。
+
+| 80/443 场景 | `--https auto` 行为 | 边界 |
+|---|---|---|
+| 两端口空闲 | 安装/使用宿主 Caddy，追加站点并校验、重载 | 需标准 `/etc/caddy/Caddyfile`、DNS 正确且 80/443 可达 |
+| 宿主 Caddy | 复用 Caddy，自有标记块更新，保留其他站点 | 同域名已在非托管配置出现则停止；自定义配置路径未自动适配 |
+| 宿主 Nginx | 写独立 `/etc/nginx/conf.d/xgift-installer.conf`；Certbot webroot 签发，启用续期 timer 和重载 hook | 需宿主 nginx 命令、有效配置且实际加载 conf.d；不覆盖非托管文件或现有同名站点 |
+| 容器反代、混合监听或其他服务 | 停止并提示，不停止原服务 | 使用 `--https external` 后自行接入；未自动修改容器或其他反代 |
+
+Caddy/Nginx 路径必须通过本机服务与公网 HTTPS 健康检查才报告完成；`external` 只验证本机服务，不签发证书、不验证外部 HTTPS。域名冲突、错误 AAAA、云安全组、防火墙、CDN 回源、非标准宿主配置和证书签发限制都可能需要人工处理，**不保证首次安装必定成功**。非 HTTP 服务占用同一入口的 443 时，不能靠新增 HTTP 站点直接共享；需迁移端口、另一个入口或外部反代。
+
+自动 HTTPS 完成（external 则先接好 HTTPS）后，打开 `https://gift.example.com/setup`，填写安装器显示的初始化口令，并设置、确认管理员密码（32–256 UTF-8 字节，不允许首尾空白、换行或空字符）。保存后点击网页重启，或运行 `systemctl restart xgift`；然后使用 `admin` 和自己设置的密码进入 `/admin` 配置业务。自动付款默认关闭；配置齐全后编辑 `/opt/xgift/site.env`，将 `XGIFT_PAYMENTS_ENABLED=false` 改为 `true` 并重启。部署、初始化、健康检查和重启本身不会发起付款。
+
+```sh
+# 非交互安装 / 仅预览计划
+bash /tmp/xgift-install.sh --yes --domain gift.example.com
+bash /tmp/xgift-install.sh --dry-run --yes --domain gift.example.com
+# 已有 HTTPS 反代
+bash /tmp/xgift-install.sh --domain gift.example.com --https external
+# 安装后的状态 / 升级 / 卸载
+bash /opt/xgift/install.sh --status
+bash /opt/xgift/install.sh --upgrade
+bash /opt/xgift/install.sh --uninstall
+```
+
+默认安装到 `/opt/xgift`，支持 `--dir`、`--port`、`--ref`、`--no-deps`；发布前或离线源码验收可使用 `--source-dir /绝对路径/源码`。编译采用单任务和内存软限制，适合小内存 VPS；完整参数运行 `--help`。重跑保留数据、密码与付款开关。升级有本机健康门禁，失败恢复旧程序及服务配置；不回滚数据库。卸载保留全部数据与密码，不删除系统依赖。备份时必须同时保留 `data/` 和 `secrets/`；历史程序备份位于 `backups/`，由管理员按需要清理。
+
+安装器 CLI 回归：`python3 deploy/install_test.py`。完整安装、HTTPS 签发和卸载应在独立 Linux 测试机验收。
+
+以下为手动部署流程。
+
+### 手动部署：构建前准备
+
+下面命令在目标 Linux 服务器的源码目录执行，使用发行版包管理器准备 Git、C 编译器、OpenSSL、Go（版本符合 `go.mod`，当前为 1.27.1）和 systemd。前端重建才需要 Node.js 22+。域名 DNS 与 80/443 入口需提前准备；**业务材料不阻塞管理员初始化**，在后台配置时再准备：
 
 1. **X 登录 Cookie**（`auth_token` 和 `ct0`）：在浏览器登录 x.com 后，按 F12 打开开发者工具 → Application（应用）→ Cookies → `https://x.com`，复制这两项的值。这是系统以你的 X 账号身份发起赠送的凭据。
 2. **用于付款的银行卡（一张或多张）**：卡号、有效期、CVC，以及发卡行登记的持卡人姓名、账单邮箱和账单国家（两位代码，如 `BD`）。多张卡会在服务端加密保存并随机轮换。请只填真实信息。
@@ -78,15 +119,13 @@ npm run preview
 
 | 用途 | 使用哪个出口 | 为什么 |
 |---|---|---|
-| X 账号与资格检查 | 始终直连 | 与定价无关 |
+| X 账号与资格检查 | 后台「查询出口」配置（可直连） | 与区域定价通道分开 |
 | **区域报价校验 + 创建付款链接** | **同一个付款出口** | **X 按出口所在国报价**，两者分离会导致下单必然失败 |
 | Stripe 接口 | 同一节点池 | 未配置时直连 |
 
 连接故障触发 6 小时冷却，安全查询最多尝试 3 个出口；付款确认不会自动重放。详见 [付款节点池配置](docs/payment-outbounds.md)。
 
-另外需要：一台 Linux 服务器、一个指向该服务器的域名、服务器上安装 Go 1.27+。
-
-### 第二步：构建
+### 手动部署：构建
 
 ```sh
 git clone https://github.com/yys9253462-gif/x_gift_bot.git
@@ -98,84 +137,111 @@ go build -tags with_quic,with_utls -o bin/xgift-web ./cmd/xgift-web
 
 > `with_quic,with_utls` 标签是必须的，否则部分代理协议不可用。
 
-### 第三步：启动服务
+### 手动部署：安装服务与密码文件
 
-只需先创建密码文件，然后启动服务，**其余配置在浏览器里完成**：
+此流程与仓库原始 unit 配套：程序在 `/opt/xgift/bin`，env 在 `/etc/xgift/site.env`，数据及可写密钥目录在 `/var/lib/xgift`。**不要运行 `xgift setup` 业务向导，不要提前创建空的 `admin-password` 文件**（网页使用排他创建，已有文件会阻止初始化）。首次启动会创建数据库，不能把旧库和新密码混用。
 
 ```sh
-./bin/xgift setup          # 生成保管库密码文件（或手工创建 0600 的密码文件）
-sudo systemctl link $PWD/deploy/xgift.service
+sudo sh -eu -c '
+  id xgift >/dev/null 2>&1 || useradd --system --user-group --home-dir /opt/xgift --shell /usr/sbin/nologin xgift
+  install -d -m 755 /opt/xgift /opt/xgift/bin
+  install -d -m 700 /etc/xgift
+  install -d -m 700 -o xgift -g xgift /var/lib/xgift /var/lib/xgift/secrets
+  for name in vault-password setup-password; do
+    if [ ! -e "/var/lib/xgift/secrets/$name" ]; then
+      (umask 077; openssl rand -hex 32 > "/var/lib/xgift/secrets/$name")
+    fi
+    chown xgift:xgift "/var/lib/xgift/secrets/$name"
+    chmod 600 "/var/lib/xgift/secrets/$name"
+  done
+'
+sudo install -m 755 bin/xgift bin/xgift-web /opt/xgift/bin/
+sudo install -m 600 deploy/site.env.example /etc/xgift/site.env
+sudoedit /etc/xgift/site.env  # 改 XGIFT_ORIGIN 为实际 HTTPS 域名；确认监听端口空闲
+sudo install -m 644 deploy/xgift.service /etc/systemd/system/xgift.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now xgift
+curl -fsS http://127.0.0.1:8787/healthz
 ```
 
-> **密码文件务必单独备份**：丢失后所有加密数据无法恢复。
+env 默认示例为 `https://gift.example.com`，密码文件在 xgift 所有的 0700 `secrets/` 内，文件权限 0600；`site.env` 由 root 保管并由 systemd 读取。原 unit 的 `ReadWritePaths=/var/lib/xgift` 允许网页创建管理员文件，不能直接将它移到只读 `/etc/xgift`。改端口或数据路径时需同步调整反代和 unit。复制 env 的命令仅用于首次安装，升级不要覆盖已有配置。
 
-服务起来后浏览器打开你的域名，会自动跳转到**首次运行向导**：
+### 手动部署：HTTPS 与管理员初始化
 
-1. **X 凭据** — 可以直接粘贴整串 Cookie，会自动拆分
-2. **支付卡** — 卡号会自动校验；多卡可在后台继续追加
-3. **出站节点** — 选直连、填节点、或粘贴 sing-box 配置；保存时会校验节点结构（tag 唯一、server 与端口齐全、拒绝 detour）
-4. **商品目录** — 用 X Premium 默认目录（3/6 个月），或自定义商户、币种和套餐
-5. **站点配置** — 填域名，自动生成配置文件和后台密码（只显示一次，同时存文件）
+程序强制监听回环地址，`XGIFT_ORIGIN` 必须是 HTTPS origin，不能含路径或尾部 `/`。已有宿主反代请追加独立站点并在校验后重载；容器不能把自己的 `127.0.0.1` 当宿主回环地址，需要自行准备可达的宿主入口/网络，不能直接公开应用端口。
 
-完成后向导页永久关闭。
+空闲入口使用宿主 Caddy 时，向其实际加载的配置追加以下站点（不要覆盖其他站点；需自行安装 Caddy）：
 
-### 第四步：配置 HTTPS 反向代理
-
-程序只监听回环地址（启动时会强制校验，不接受对外监听），需要 Caddy 或任意反向代理提供 HTTPS。`deploy/Caddyfile` 是模板，把域名替换后放到 Caddy 配置目录 reload 即可。
-
-验证：
+```caddyfile
+gift.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8787
+}
+```
 
 ```sh
-curl https://你的域名/healthz     # {"ok":true,...} 即成功
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+curl -fsS https://gift.example.com/healthz
 ```
 
-### 第五步：开始使用
+`deploy/Caddyfile` 是**仅允许 Cloudflare 来源**的另一种模板，不是直接公网通用模板；它要求 Cloudflare 代理、正确来源头和实际加载该配置。直接照抄会使非 Cloudflare 请求返回 403。Nginx/其他反代需自行配置证书、续期、域名、Host 和 HTTPS 转发头；不想手工处理宿主 Nginx 的签发时使用前述安装器。
 
-浏览器打开 `https://你的域名/admin`，输入用户名 `admin` 和向导生成的密码。
+HTTPS 检查得到 `{"ok":true,...}` 后，用服务器终端本地读取初始化口令（不提交到日志或工单）：
 
-在「兑换码」页选套餐、数量、批次名生成兑换码，复制或下载发给用户。用户打开站点输入兑换码和 X 用户名即可完成充值。
+```sh
+sudo cat /var/lib/xgift/secrets/setup-password
+```
+
+1. 打开 `https://gift.example.com/setup`，输入初始化口令，只设置并确认管理员密码（32–256 UTF-8 字节，不允许首尾空白、换行或空字符）。
+2. 点击网页重启，或 `sudo systemctl restart xgift`；重启后 `/setup` 不再开放。
+3. 打开 `https://gift.example.com/admin`，使用 `admin` 和自己设置的密码登录，配置 X 凭据、支付卡、查询出口、付款出站、商品和价格。
+4. 检查业务配置后，编辑 `/etc/xgift/site.env` 的 `XGIFT_PAYMENTS_ENABLED=true` 并重启。配置不全时启用会导致启动失败；先恢复 `false` 排查。`/healthz` 的 `ok` 只表示服务健康，不证明能下单或付款。
+
+在「兑换码」页生成套餐、数量和批次，复制或下载给用户。保管库密码必须与数据库一起备份；初始化口令与管理员密码不是保管库解密密钥。
 
 ---
 
 ## 日常维护
 
-配置调整都在后台完成。命令行用于检查和排障：
+业务配置主要在后台完成；域名、监听地址、付款开关与 Turnstile 环境变量仍在 env 调整并重启。CLI 不自动读取 systemd 的 env，也不能依赖默认 `sqlite/vault.db` 指向线上数据。在维护终端先定义以下函数，再执行本节命令（以下按默认一键安装；手动部署将两条路径改为 `/var/lib/xgift/vault.db` 和 `/var/lib/xgift/secrets/vault-password`）：
 
 ```sh
-./bin/xgift status                        # 检查所有加密记录是否完好
-./bin/xgift check                         # 测试代理能否访问 x.com
-./bin/xgift check-payment-outbounds       # 探测付款出口（不发真实请求）
-./bin/xgift resume-payments               # 解除付款暂停
-./bin/xgift import-chrome                 # macOS：从本机 Chrome 重新导入 Cookie
+xgift() {
+  sudo -u xgift /opt/xgift/bin/xgift --db=/opt/xgift/data/vault.db --password-file=/opt/xgift/secrets/vault-password "$@"
+}
+xgift status                             # 校验必要业务记录，不是全库完整性检查
+xgift check                         # 测试代理能否访问 x.com
+xgift check-payment-outbounds       # 访问公共探测端点，不创建订单、不付款
+xgift resume-payments               # 解除付款暂停
+xgift import-chrome                 # macOS：从本机 Chrome 重新导入 Cookie
 
-./bin/xgift ops show                      # 查看当前 GraphQL 标识
-./bin/xgift ops probe                     # 探测标识是否仍被 X 接受
+xgift ops show                      # 查看当前 GraphQL 标识
+xgift ops probe                     # 探测标识是否仍被 X 接受
 ```
 
 更新配置用 `put`（从标准输入读取新值）：
 
 ```sh
-./bin/xgift cards list
-echo '新的ct0等JSON' | ./bin/xgift put --name cookies
-echo 'pk_live_新公钥' | ./bin/xgift put --name stripe-key
-echo '{"merchant":"acct_...","currency":"bdt","plans":[...]}' | ./bin/xgift put --name catalog
+xgift cards list
+echo '新的ct0等JSON' | xgift put --name cookies
+echo 'pk_live_新公钥' | xgift put --name stripe-key
+echo '{"merchant":"acct_...","currency":"bdt","plans":[...]}' | xgift put --name catalog
 ```
 
 `--name` 支持：`cookies`、`api-auth`、`card`、`cards`、`proxy`、`payment-outbounds`、`stripe-key`、`catalog`。
 
-> **CLI 参数位置有讲究**：全局标志必须写在子命令**之前**且用等号形式，例如
-> `xgift cards list -db=/var/lib/xgift/vault.db`（写成 `-db PATH` 会报 `unexpected argument`）。
+> **CLI 参数规则（`cmd/xgift/main.go`）**：解析器会把标志移到位置参数前，所以 `--db=PATH`、`--db PATH` 都可写在子命令前后，例如 `xgift cards list --db=/var/lib/xgift/vault.db`。单横线形式请用 `-db=PATH`；`-db PATH` 不会被预解析器识别为带值标志，会导致 `unexpected argument`。推荐上面的函数固定库与密码路径，其他参数统一使用双横线。
 
 ### 抗上游失效
 
 X 更换 `queryId` 时：
 
 ```sh
-./bin/xgift ops show                                  # 看当前生效值和来源
-./bin/xgift ops set <操作名> <queryId>                # 覆盖，下一笔订单即生效
-./bin/xgift ops reset                                 # 回到编译进程序的默认值
-./bin/xgift ops probe                                 # 探测是否仍被接受
+xgift ops show                                  # 看当前生效值和来源
+xgift ops set <操作名> <queryId>                # 覆盖，下一笔订单即生效
+xgift ops reset                                 # 回到编译进程序的默认值
+xgift ops probe                                 # 探测是否仍被接受
 ```
 
 `<操作名>` 是三者之一：
@@ -191,27 +257,64 @@ X 更换 `queryId` 时：
 仓库内带了两个只读工具，排查线上问题用：
 
 ```sh
-go run ./tools/readfail    /path/to/vault.db          # 列出 vault 记录，解密指定前缀的审计内容
-go run ./tools/priceprobe                             # 从当前出口向 X 询价，看真实币种与金额
+XGIFT_PASSWORD_FILE=/opt/xgift/secrets/vault-password go run ./tools/readfail /opt/xgift/data/vault.db
+# 加第二个位置参数（如 audit:）才解密并显示匹配前缀的最近三条记录
+XGIFT_PASSWORD_FILE=/opt/xgift/secrets/vault-password go run -tags with_quic,with_utls ./tools/priceprobe --db=/opt/xgift/data/vault.db --user=example_user --months=3
 ```
 
-两个工具都**不创建订单、不提交付款**。
+在源码目录执行，使用有权读取数据和密码的服务器账号；手动部署按前述路径替换，不能把这些工具输出直接公开。两个工具都**不创建订单、不提交付款**，但解密工具打开 vault 时会写自检记录，并非磁盘严格只读；询价需要业务配置和上游可达，且会显示配置元数据。
 
 ### 付款卡轮换
 
-付款卡按「卡 × 节点」组合随机轮换：每 3 个连续订单使用同一组合；任意订单被拒后立即换组合，被拒的那张卡进入 30 分钟冷却（其他卡继续轮换），补单也走同一逻辑。支付方明确 `do_not_try_again` 时该卡永久封锁直到显式解除。
+付款卡按「卡 × 节点」组合随机轮换：每 3 个连续订单使用同一组合；拒付后立即换组合，先冷却该出口及共享 IP 30 分钟，同一卡在两个不同节点都被拒才进入整卡 30 分钟冷却。补单共用此逻辑；支付方明确 `do_not_try_again` 时该卡永久封锁直到显式解除。
 
 `cards add` 追加或更新（同卡号替换），`cards remove --last4 1234` 移除，`cards rotate` 立即结束当前组合，`cards unblock` 清除冷却与永久封锁。
+
+### 备份、恢复、升级与卸载
+
+一键安装使用 `/opt/xgift/data`、`/opt/xgift/secrets` 和 `/opt/xgift/site.env`；手动部署使用 `/var/lib/xgift`（含 secrets）和 `/etc/xgift/site.env`。备份必须包含两份数据库、WAL 等伴随文件、全部密钥、env 和部署状态；**安装器的 `backups/` 只备份程序/配置，不是数据库备份**。为得到一致副本，先停服务，并确认没有 CLI 付款或补单正在运行：
+
+```sh
+sudo systemctl stop xgift
+# 默认一键安装；备份文件仅 root 可读
+sudo sh -eu -c 'umask 077; tar -czf /root/xgift-backup-$(date +%Y%m%d-%H%M%S).tar.gz -C /opt/xgift data secrets site.env install.conf'
+sudo systemctl start xgift
+```
+
+手动部署的备份命令改为 `sudo sh -eu -c 'umask 077; tar -czf /root/xgift-backup-$(date +%Y%m%d-%H%M%S).tar.gz -C / var/lib/xgift etc/xgift/site.env etc/systemd/system/xgift.service'`。另存副本到不同故障域并确认能解包；归档含密钥，按敏感资料保护。恢复时停服务，成套恢复数据与原密钥，恢复 xgift 所有权、目录 0700/密钥 0600 后启动；不要只恢复某一份数据库，也不要将旧密文搭配新生成密钥。
+
+一键安装先备份，再运行 `sudo bash /opt/xgift/install.sh --upgrade`（可带 `--ref`）；本机和非 external 的公网健康检查失败会恢复旧程序及服务配置，**不会回滚数据库或本次已安装的依赖、目录、密码**。手动升级先另存旧二进制与 unit，再构建、停服务、备份数据、安装两个新二进制并启动；不要覆盖现有 env 或在线数据库。数据格式发生迁移后，不能假定旧二进制兼容，回退前核对版本或恢复完整备份。
+
+一键卸载 `sudo bash /opt/xgift/install.sh --uninstall` 会停用服务，移除自有 Caddy 标记块/Nginx 站点及相关 hook，保留安装目录、数据、密码、系统依赖与证书；external 的反代入口由你自行移除。手动部署可运行 `sudo systemctl disable --now xgift && sudo rm /etc/systemd/system/xgift.service && sudo systemctl daemon-reload`，再摘除自行配置的反代站点；不删除数据和密钥。
+
+### 验收与排错
+
+```sh
+python3 deploy/install_test.py        # 安装器参数/计划回归，非完整安装验收
+npm run check                        # TypeScript 检查
+# Linux + CGO 编译器 + go.mod 要求的 Go
+go test -tags with_quic,with_utls ./...
+sudo systemctl --no-pager status xgift
+sudo journalctl -u xgift -n 80 --no-pager
+curl -fsS http://127.0.0.1:8787/healthz   # 换成 env 的实际端口
+curl -fsS https://gift.example.com/healthz
+```
+
+- 本机不通：核对 unit 的 env 路径、`XGIFT_ORIGIN` 格式、空闲监听端口、数据/密钥所有权及权限。`site is not initialised` 通常缺少可读初始化口令；不要用创建空管理员文件修复。已有空/损坏管理员文件要先备份并明确其来源再处理。
+- 本机正常、公网不通：检查 DNS A/AAAA、安全组 80/443、证书、实际加载的反代配置与 CDN 回源。external 模式安装成功不代表外部接入完成。
+- `/setup` 保存失败：确认管理员文件不存在、父目录对 xgift 可写且包含在 unit 的 `ReadWritePaths`；初始化保存后必须重启。
+- 付款开关开启后启动失败：暂时恢复 `false`，核查后台业务配置与日志；部署健康检查不会验证 Cookie 有效、区域报价或银行是否接受付款。
+- 构建 OOM/上游下载失败：检查可用内存、磁盘、DNS 和下载链路，处理后重跑；不要把内存软限制当作不会 OOM 的承诺。完整安装、签发、升级恢复和卸载仍需独立 Linux 主机实测。
 
 ---
 
 ## 常见问题
 
-**密码文件丢了怎么办？** 无法恢复。加密数据全部作废，需要删除 `vault.db` 后重新初始化。请把它和数据库一起备份。
+**保管库密码文件丢了怎么办？** 没有原密钥就无法解密原数据；先从成套备份恢复，不要直接删除线上数据库。确认无法恢复后，停服务、保留故障副本，再将旧数据和管理员文件一同移出，使用新密钥重新初始化；原兑换码与订单不会自动恢复。请将数据和 secrets 一起备份。
 
-**X Cookie 过期了？** 后台「X 登录凭据」页直接粘贴新 Cookie 即可（支持整串粘贴自动拆分）。macOS 上也可以用 `./bin/xgift import-chrome` 一键刷新。
+**X Cookie 过期了？** 后台「X 登录凭据」页直接粘贴新 Cookie 即可（支持整串粘贴自动拆分）。macOS 上也可以用 `xgift import-chrome` 一键刷新。
 
-**想暂停充值？** 后台调整，或把 `site.env` 里 `XGIFT_PAYMENTS_ENABLED` 改为 `false` 并重启服务。用户兑换会被婉拒，兑换码不消耗。
+**想暂停自动充值？** 把对应部署路径的 `site.env` 中 `XGIFT_PAYMENTS_ENABLED` 改为 `false` 并重启服务，自动兑换会被婉拒、兑换码不消耗。此环境开关不等同于付款保护暂停，也不禁止管理员显式确认的手动补单。
 
 **报价金额和实际不符？** 检查「付款出站」配置。X 按出口所在国报价，报价校验与创建链接必须走同一出口。
 
@@ -219,19 +322,19 @@ go run ./tools/priceprobe                             # 从当前出口向 X 询
 
 **付款结果不明怎么办？** 系统宁可标记「待核实」也不会重复扣款。用户用原兑换码点「重新检查并继续兑换」即可自动核对。
 
-**升级程序？** 重新构建两个二进制，备份数据目录和密码文件，替换后 `systemctl restart xgift`。不要覆盖线上数据库。
+**升级程序？** 一键安装先备份，再运行 `sudo bash /opt/xgift/install.sh --upgrade`；手动部署重新构建两个二进制，停服务并备份后替换。不要覆盖现有 env 或线上数据库，详见「备份、恢复、升级与卸载」。
 
 ---
 
 ## 数据与安全
 
 - `vault.db`：所有敏感信息（Cookie、卡、代理、订单）逐条 AES-256-GCM 加密，密钥由 scrypt 从密码文件派生。没有密码文件谁也读不了。打开时会写一条自检记录验证密码，**密码错误在打开阶段就失败**，不会等到读数据时才报错。
-- `site.db`：兑换码只存摘要和尾号，不存明文；用户名、状态为明文。请限制文件权限。
+- `site.db`：兑换码索引存摘要和尾号，用户名、状态为明文；可还原的完整兑换码保存在加密 vault 中，历史仅存摘要的兑换码无法还原。请限制两份数据库的文件权限。
 - 密钥文件均为 0600；后台使用 HTTPS Basic Auth（密码先哈希再常量时间比较）。
 - 接口有限流（按端点分桶、按真实 IP）和同源校验（POST 校验 `Origin`）。
 - 响应头带严格 CSP（`default-src 'none'`）、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`nosniff`。
 - systemd 单元启用 `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp`、`UMask=0077`。
-- 配置向导与后台设置的所有密钥**不落日志、不回显、不进错误信息**。
+- 网页初始化与后台设置不回显完整密钥；安装器会在终端显示初始化口令，诊断工具可能解密审计内容，相关终端记录与输出仍需保密。
 
 ### 管理员手动补单
 
@@ -257,7 +360,7 @@ internal/
   checkout/         下单流程：资格检查、区域报价、创建订单、付款确认、补单
                    opsprobe.go 实现 GraphQL 标识的在线探测
   site/             Web 服务
-                   setup.go / setupcfg.go   首次运行向导
+                   setup.go / setupcfg.go   管理员初始化与配置校验
                    settings.go              后台设置 API
                    outbounds.go             付款出站管理
   proxy/            内嵌 sing-box，提供付款出口
@@ -272,7 +375,7 @@ frontend/           React 19 + MUI 7，esbuild 构建
 tools/
   priceprobe/       只读：向 X 询价，核对实际币种与金额
   readfail/         只读：查看 vault 记录与失败审计
-deploy/             systemd 单元、Caddyfile、site.env 示例
+deploy/             交互式 install.sh、CLI 回归、systemd 单元、Caddyfile、site.env 示例
 docs/               付款节点池说明
 ```
 
