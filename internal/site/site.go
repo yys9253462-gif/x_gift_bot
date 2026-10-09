@@ -240,8 +240,16 @@ func Run(ctx context.Context) error {
 	if err = migratePartner(db); err != nil {
 		return err
 	}
+	if err = migrateProvision(db); err != nil {
+		return err
+	}
 	// A crash is never interpreted as permission to submit the same payment again.
 	if _, err = db.Exec("UPDATE codes SET status='review',message=?,updated=? WHERE status='processing'", "订单处理被中断，请查询原订单或联系管理员核实；请勿重复兑换。", time.Now().Unix()); err != nil {
+		return err
+	}
+	// 商城开通任务同样不能在崩溃后被当作已完成：停在 processing 的任务
+	// 要么是进程中断，要么是上游结果未明，两种都必须人工核实。
+	if _, err = db.Exec("UPDATE partner_provisions SET status='review',message=?,updated=? WHERE status='processing'", "服务中断，开通结果未确认，请人工核实；请勿重复提交。", time.Now().Unix()); err != nil {
 		return err
 	}
 	raw, err := v.Get("proxy")
@@ -292,6 +300,11 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/partner/ping", s.partner(s.partnerPing))
 	mux.HandleFunc("POST /api/partner/fulfill", s.partner(s.partnerFulfill))
 	mux.HandleFunc("POST /api/partner/revoke", s.partner(s.partnerRevoke))
+	// 直接开通：商城填 X 用户名后由这里执行赠送，买家无需自己去兑换。
+	// 校验接口是只读的，供商城在收款之前确认用户名真实存在。
+	mux.HandleFunc("POST /api/partner/verify", s.partner(s.partnerVerify))
+	mux.HandleFunc("POST /api/partner/provision", s.partner(s.partnerProvision))
+	mux.HandleFunc("GET /api/partner/provision", s.partner(s.provisionStatus))
 	mux.HandleFunc("GET /admin", s.admin(s.asset("admin.html", "text/html; charset=utf-8")))
 	mux.HandleFunc("GET /admin.js", s.admin(s.asset("admin.js", "application/javascript; charset=utf-8")))
 	mux.HandleFunc("GET /api/admin/codes", s.admin(s.list))
