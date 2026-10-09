@@ -188,7 +188,7 @@ class InstallerCLI(unittest.TestCase):
             if "curl -fSL" in line:
                 self.assertIn("--max-time", line)
                 self.assertIn("--retry", line)
-        self.assertLess(source.index('install -m 700 "$TMP/src/deploy/install.sh" "$TMP/install.sh"'),
+        self.assertLess(source.index('install -m 700 "$TMP_ASSETS/install.sh" "$TMP/install.sh"'),
                         source.index('install -m 600 "$TMP/install.conf" "$ROOT/install.conf"'))
         self.assertIn('REF=%s', source)
         self.assertIn('cp "$BACKUP/$name" "$ROOT/$name"', source)
@@ -225,12 +225,12 @@ class InstallerCLI(unittest.TestCase):
             root.mkdir()
             temporary = Path(directory) / "tmp"
             temporary.mkdir()
-            src = temporary / "src" / "deploy"
+            src = temporary / "assets"
             src.mkdir(parents=True)
             (src / "install.sh").write_text("new installer")
             state = root / "install.conf"
             state.write_text("old state")
-            body = (f'ROOT={str(root)!r}; TMP={str(temporary)!r}; DOMAIN=new.example.com; PORT=8999; MODE=external; REF=release; '
+            body = (f'ROOT={str(root)!r}; TMP={str(temporary)!r}; TMP_ASSETS={str(src)!r}; DOMAIN=new.example.com; PORT=8999; MODE=external; REF=release; '
                     'install() { if [[ ${@: -1} == "$ROOT/install.sh" ]]; then return 9; fi; command install "$@"; };\n' + stage)
             result = subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + body], capture_output=True, text=True)
             self.assertEqual(result.returncode, 9, result.stderr)
@@ -558,6 +558,37 @@ echo "files=$left"
 
     def test_lf(self):
         self.assertNotIn(b"\r", SCRIPT.read_bytes())
+
+    def test_deploy_assets_do_not_depend_on_source_checkout(self):
+        """预编译路径没有源码目录，部署资产不能改成从 $TMP/src 读。
+
+        回归用例：曾经 xgift.service 与 install.sh 都从 $TMP/src/deploy 取，
+        而预编译路径从不创建 $TMP/src —— 结果是二进制下载校验全过、却在装
+        systemd 单元时 sed 报「No such file or directory」并触发整轮回滚。
+        """
+        source = SCRIPT.read_text()
+        # 两处消费点必须走 $TMP_ASSETS，不能是 $TMP/src/deploy。
+        self.assertIn('"$TMP_ASSETS/xgift.service"', source)
+        self.assertIn('"$TMP_ASSETS/install.sh"', source)
+        self.assertNotIn('"$TMP/src/deploy/xgift.service"', source)
+        self.assertNotIn('"$TMP/src/deploy/install.sh"', source)
+        # $TMP/src 只能出现在编译分支内部（在 stage_assets 定义之前）。
+        stage_at = source.index("stage_assets() {")
+        for line in source[:stage_at].splitlines():
+            if "TMP/src" in line and not line.lstrip().startswith("#"):
+                self.assertIn("PREBUILT", source[:stage_at],
+                              f"$TMP/src 在编译分支外被使用: {line.strip()}")
+                break
+
+    def test_stage_assets_handles_both_paths(self):
+        """stage_assets 必须为预编译路径单独取 deploy/*，且缺失时报硬错误。"""
+        source = SCRIPT.read_text()
+        block = source[source.index("stage_assets() {"):source.index("stage_assets() {") + 1300]
+        self.assertIn("raw/$REF/deploy", block, "预编译路径必须从同 tag 取 deploy/*")
+        self.assertIn("for asset in xgift.service install.sh", block)
+        self.assertIn("--retry", block, "取部署资产必须带重试")
+        # 取不到必须 die，不能静默沿用旧单元。
+        self.assertIn("stage_assets || die", source)
 
     def test_release_workflow_shape(self):
         """发布工作流必须仍然产出安装器期望的资产名，并按架构原生构建。"""

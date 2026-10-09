@@ -542,6 +542,11 @@ trap 'exit 143' TERM
 # 优先用 Release 里的预编译二进制：用户不必装 Go 工具链、拉 1.4 GB 依赖树、
 # 再花几分钟编译。下载或校验失败都自动回退到在目标机编译，不会因为发布侧
 # 的问题让用户装不上。--source-dir 与 --build-from-source 直接走编译。
+#
+# 无论走哪条路径，部署资产（systemd 单元、安装器自身）都必须先落地到
+# $TMP/assets：预编译路径不会克隆源码，若沿用 $TMP/src/deploy 会直接读不到文件。
+TMP_ASSETS="$TMP/assets"
+mkdir -p "$TMP_ASSETS"
 PREBUILT=0
 if ((DRY)); then
   log 'dry-run：跳过预编译下载与编译。'
@@ -592,6 +597,32 @@ if ((PREBUILT == 0 && DRY == 0)); then
   (cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
   log "编译完成，用时 $(( $(date +%s) - START_BUILD )) 秒"
 fi
+# 部署资产落地。编译路径从 $TMP/src/deploy 取，预编译路径没有源码目录，
+# 改为下载与编译器同一个 tag 的 deploy/*（此时 $REF 已在 download_prebuilt
+# 里校验过对应的 Release 资产）。取不到就是硬错误：systemd 单元和安装器
+# 自身都必须来自与二进制同一版本，不能拿运行中的旧副本凑。
+stage_assets() {
+  local base src_dir
+  if ((PREBUILT == 0)); then
+    src_dir="$TMP/src/deploy"
+  else
+    base="https://github.com/$REPO/raw/$REF/deploy"
+    src_dir="$TMP_ASSETS/fetched"
+    mkdir -p "$src_dir"
+    local asset
+    for asset in xgift.service install.sh; do
+      curl -fSL --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 120 \
+        --retry-delay 2 --retry-all-errors "$base/$asset" -o "$src_dir/$asset" 2>/dev/null \
+        || return 1
+    done
+  fi
+  [[ -f $src_dir/xgift.service && -f $src_dir/install.sh ]] || return 1
+  cp "$src_dir/xgift.service" "$src_dir/install.sh" "$TMP_ASSETS/"
+  return 0
+}
+if ((DRY == 0)); then
+  stage_assets || die "无法取得部署资产（xgift.service / install.sh，来自 $REF）；请改用 --build-from-source 或 --source-dir"
+fi
 # Stage and validate the reverse proxy before touching the running application.
 if [[ $MODE == caddy ]]; then
   CADDY_STAGE=$(mktemp /etc/caddy/.xgift-stage-XXXXXX)
@@ -641,7 +672,7 @@ XGIFT_ADMIN_PASSWORD_FILE=$ROOT/secrets/admin-password
 XGIFT_SETUP_PASSWORD_FILE=$ROOT/secrets/setup-password
 ENV
 install -m 600 "$TMP/env" "$ROOT/site.env"
-sed -e "s|/opt/xgift|$ROOT|g" -e "s|/etc/xgift/site.env|$ROOT/site.env|" -e "s|/var/lib/xgift|$ROOT/data $ROOT/secrets|" "$TMP/src/deploy/xgift.service" > /etc/systemd/system/xgift.service
+sed -e "s|/opt/xgift|$ROOT|g" -e "s|/etc/xgift/site.env|$ROOT/site.env|" -e "s|/var/lib/xgift|$ROOT/data $ROOT/secrets|" "$TMP_ASSETS/xgift.service" > /etc/systemd/system/xgift.service
 systemctl daemon-reload
 systemctl enable --now xgift
 healthy=0
@@ -704,7 +735,7 @@ if [[ $MODE != external ]]; then
   ((tls_ok)) || die '公网 HTTPS 健康检查失败：检查 DNS、云安全组 80/443、AAAA 记录及 CDN 回源；已触发程序/配置回滚'
 fi
 # Publish both files only after staging succeeds; rollback restores both on failure.
-install -m 700 "$TMP/src/deploy/install.sh" "$TMP/install.sh"
+install -m 700 "$TMP_ASSETS/install.sh" "$TMP/install.sh"
 printf 'DOMAIN=%s\nPORT=%s\nMODE=%s\nREF=%s\n' "$DOMAIN" "$PORT" "$MODE" "$REF" > "$TMP/install.conf"
 install -m 700 "$TMP/install.sh" "$ROOT/install.sh"
 install -m 600 "$TMP/install.conf" "$ROOT/install.conf"
