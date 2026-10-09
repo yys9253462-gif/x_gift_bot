@@ -618,6 +618,17 @@ installer_looks_current() {
   bash -n "$file" 2>/dev/null || return 1
   grep -q 'TMP_ASSETS' "$file"
 }
+# 拉取时必须显式要求不走缓存。raw.githubusercontent.com 的 CDN 会按
+# Cache-Control: max-age=300 缓存 5 分钟，而自举恰恰发生在一个修复刚推上去、
+# 缓存还没过期的时刻——此时会拉回**修复前**的安装器，等于自举没有发生。
+# 加 no-cache 让它回源；即使中间设备忽略该头，后面的 installer_looks_current
+# 自检以及"候选取不到就换下一个"的逻辑仍能兜住。
+fetch_installer() {
+  local candidate=$1 dest=$2
+  curl -fSL --retry 2 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+    -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    "https://raw.githubusercontent.com/$REPO/$candidate/deploy/install.sh" -o "$dest" 2>/dev/null
+}
 if [[ $ACTION == upgrade && -z $SOURCE_DIR && $DRY == 0 && ${XGIFT_BOOTSTRAPPED:-0} != 1 ]]; then
   command -v curl >/dev/null || die '升级需要 curl'
   UPDATE_TMP=$(mktemp -d)
@@ -625,8 +636,7 @@ if [[ $ACTION == upgrade && -z $SOURCE_DIR && $DRY == 0 && ${XGIFT_BOOTSTRAPPED:
   UPDATE_LATEST=$(latest_release_ref)
   for candidate in main "$UPDATE_LATEST" "$REF"; do
     [[ -n $candidate ]] || continue
-    if curl -fSL --retry 2 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
-         "https://raw.githubusercontent.com/$REPO/$candidate/deploy/install.sh" -o "$UPDATE_TMP/install.sh" 2>/dev/null \
+    if fetch_installer "$candidate" "$UPDATE_TMP/install.sh" \
        && installer_looks_current "$UPDATE_TMP/install.sh"; then
       log "升级前已取得安装器（$candidate）。"
       XGIFT_BOOTSTRAPPED=1 bash "$UPDATE_TMP/install.sh" "${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"

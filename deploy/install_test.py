@@ -318,6 +318,15 @@ class InstallerCLI(unittest.TestCase):
         # 每个候选都必须过一次合格性检查；不合格的不能拿去重跑。
         self.assertIn('&& installer_looks_current "$UPDATE_TMP/install.sh"', bootstrap)
 
+        # 拉取必须走 fetch_installer，并显式要求不走缓存。
+        # 原因：raw.githubusercontent.com 按 max-age=300 缓存 5 分钟，而自举恰恰
+        # 发生在"修复刚推上去、缓存还没过期"的时刻——不加 no-cache 会拉回修复前
+        # 的安装器，自举等于没发生（真机 us5x 上亲历过一次）。
+        self.assertIn("fetch_installer() {", bootstrap)
+        self.assertIn("fetch_installer \"$candidate\" \"$UPDATE_TMP/install.sh\"", bootstrap)
+        self.assertIn("Cache-Control: no-cache", bootstrap)
+        self.assertIn("Pragma: no-cache", bootstrap)
+
         # 全都不合格时退回当前文件，而不是用带 bug 的旧版本。
         self.assertIn('bash "$SELF"', bootstrap)
 
