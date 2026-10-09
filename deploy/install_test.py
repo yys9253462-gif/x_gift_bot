@@ -461,8 +461,130 @@ class InstallerCLI(unittest.TestCase):
         # 升级重入必须带上原参数，否则 --jobs/--goproxy 会在 bootstrap 时丢失。
         self.assertIn('"${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"', source)
 
+    def test_prebuilt_download_verifies_checksum(self):
+        """预编译产物必须校验 SHA256；不匹配要拒绝且不留下任何二进制。"""
+        import hashlib
+        source = SCRIPT.read_text()
+        self.assertIn("download_prebuilt", source)
+        self.assertIn("SHA256SUMS", source)
+        self.assertIn("sha256sum", source)
+
+        good = b"#!/bin/sh\necho xgift\n"
+        digest = hashlib.sha256(good).hexdigest()
+        sums = (f"{digest}  xgift-linux-amd64\n"
+                f"{digest}  xgift-web-linux-amd64\n")
+
+        def run(sums_body, payload, uname_out="x86_64", curl_status=0):
+            # curl is shadowed: the checksum manifest and both binaries come from
+            # fixtures, so the verification path is exercised without network.
+            # log() must reach stderr: the tamper case is only observable there.
+            with tempfile.TemporaryDirectory() as directory:
+                d = Path(directory)
+                (d / "sums").write_text(sums_body)
+                (d / "payload").write_bytes(payload)
+                body = f'''
+uname() {{ echo {uname_out}; }}
+TMP={str(d)!r}/tmp
+mkdir -p "$TMP"
+log() {{ printf "%s\\n" "$*" >&2; }}
+curl() {{
+  local u=${{@: -1}}
+  case "$u" in
+    */SHA256SUMS) cp {str(d / "sums")!r} "$u" 2>/dev/null || return 1;;
+    *) cp {str(d / "payload")!r} "$u" 2>/dev/null || return 1;;
+  esac
+  return {curl_status}
+}}
+REPO=owner/repo; REF=v1.0.0
+if download_prebuilt; then
+  echo "result=ok"
+else
+  echo "result=fallback"
+fi
+# 未通过校验的二进制绝不能留在 TMP 里被后续流程用到。
+left=$(find "$TMP" -type f 2>/dev/null | wc -l)
+echo "files=$left"
+'''
+                # Must go through run_function: it injects the real
+                # download_prebuilt so the verification path is the shipped one.
+                return self.run_function("download_prebuilt", body)
+
+        # 校验通过：两个二进制就位。
+        ok = run(sums, good)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertIn("result=ok", ok.stdout)
+        self.assertIn("files=2", ok.stdout)
+
+        # 校验不匹配：必须回退，且不能留下任何未验证的二进制。
+        bad = run(sums, b"#!/bin/sh\necho tampered\n")
+        self.assertEqual(bad.returncode, 0, bad.stderr)
+        self.assertIn("result=fallback", bad.stdout)
+        self.assertIn("不匹配", bad.stderr)
+        self.assertIn("files=0", bad.stdout)
+
+        # 清单里没有本架构的记录：回退，不猜文件名。
+        missing = run(f"{digest}  xgift-linux-arm64\n", good)
+        self.assertIn("result=fallback", missing.stdout)
+
+        # 清单本身不可达：回退。curl 对任何地址都失败并返回非零。
+        unreachable = self.run_function(
+            "download_prebuilt",
+            'uname() { echo x86_64; }\n'
+            'log() { printf "%s\\n" "$*" >&2; }\n'
+            'curl() { return 22; }\n'
+            'REPO=owner/repo; REF=v1.0.0\n'
+            'TMP=$(mktemp -d)\n'
+            'if download_prebuilt; then echo "result=ok"; else echo "result=fallback"; fi\n')
+        self.assertIn("result=fallback", unreachable.stdout)
+        self.assertIn("没有发布预编译产物", unreachable.stderr)
+
+        # 不支持的架构：回退，不尝试下载。
+        other = run(sums, good, uname_out="riscv64")
+        self.assertIn("result=fallback", other.stdout)
+
+    def test_installer_prefers_prebuilt_then_falls_back(self):
+        """主流程顺序：先试预编译，失败才走编译；显式参数直接编译。"""
+        source = SCRIPT.read_text()
+        prebuilt_at = source.index("if download_prebuilt; then")
+        compile_at = source.index("START_BUILD=$(date +%s)")
+        self.assertLess(prebuilt_at, compile_at, "预编译必须先于编译尝试")
+        # 三条直接编译的旁路都要在。
+        self.assertIn("--build-from-source", source)
+        self.assertIn("((FROM_SOURCE))", source)
+        self.assertIn("elif [[ -n $SOURCE_DIR ]]", source)
+        # 编译前必须已经确定 BUILD_JOBS 与 GOPROXY，不能因跳过而留下未定义变量。
+        self.assertIn("plan_build_parallelism", source)
+        self.assertIn("setup_go_proxy", source)
+
     def test_lf(self):
         self.assertNotIn(b"\r", SCRIPT.read_bytes())
+
+    def test_release_workflow_shape(self):
+        """发布工作流必须仍然产出安装器期望的资产名，并按架构原生构建。"""
+        path = SCRIPT.parent.parent / ".github" / "workflows" / "release.yml"
+        self.assertTrue(path.exists(), "缺少 release.yml，预编译路径会永远回退")
+        text = path.read_text()
+        # 安装器按这些名字拼 URL，改名就会下载失败。
+        for asset in ("xgift-linux-", "xgift-web-linux-", "SHA256SUMS"):
+            self.assertIn(asset, text, f"工作流不再产出 {asset}")
+        # CGO 依赖使得纯 Go 交叉编译不可行，必须两个原生 runner。
+        self.assertIn("ubuntu-24.04-arm", text)
+        self.assertIn("ubuntu-24.04", text)
+        # 静态链接自检：判据必须是 ldd 的退出码，不能是输出文本匹配。
+        self.assertIn('if ldd "$f" >/dev/null 2>&1; then', text,
+                      "静态链接自检必须用 ldd 退出码判定")
+        # tag 触发。
+        self.assertIn("tags:", text)
+        # YAML 缩进一旦被破坏就整体不工作，这里做一次解析兜底。
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML 不可用")
+        parsed = yaml.safe_load(text)
+        build = parsed["jobs"]["build"]
+        self.assertEqual(parsed["permissions"]["contents"], "write")
+        self.assertEqual(len(build["strategy"]["matrix"]["include"]), 2)
+        self.assertIn("publish", parsed["jobs"])
 
 
 if __name__ == "__main__":

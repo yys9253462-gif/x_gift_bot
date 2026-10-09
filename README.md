@@ -75,7 +75,7 @@ curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/re
 
 请以 root 登录执行；非 root 用户将最后的 `bash` 改成 `sudo bash`。下载失败时不会继续运行，也不会让下载管道占用交互输入。
 
-安装器询问域名和确认，自动安装编译依赖与匹配 `go.mod` 的 Go（官方 SHA256 校验，不替换系统 Go）、构建两个程序、配置 systemd 并生成保管库密码和初始化口令。默认自动选空闲本机端口（从 8787 起）。首次构建可能耗时较长；编译并行度与 Go 内存软限制不等于总内存上限，仍可能遇到 OOM、下载或编译失败。
+安装器询问域名和确认后，**优先下载官方 GitHub Release 里对应架构的预编译程序**（当前上游仓库已有发布时，通常几十秒即可装完，无需在目标机编译）；下载后先核对 `SHA256SUMS` 中的 SHA256，校验不通过或没有匹配架构的产物时，会自动回退到源码编译，不会留下任何未经验证的文件。回退路径会自动安装编译依赖与匹配 `go.mod` 的 Go（官方 SHA256 校验，不替换系统 Go）、构建两个程序。两条路径都会配置 systemd 并生成保管库密码和初始化口令，默认自动选空闲本机端口（从 8787 起）。回退到源码编译时首次构建可能耗时较长（取决于网络与机器）；编译并行度与 Go 内存软限制不等于总内存上限，仍可能遇到 OOM、下载或编译失败。
 
 | 80/443 场景 | `--https auto` 行为 | 边界 |
 |---|---|---|
@@ -102,7 +102,11 @@ bash /opt/xgift/install.sh --upgrade
 bash /opt/xgift/install.sh --uninstall
 ```
 
-默认安装到 `/opt/xgift`，支持 `--dir`、`--port`、`--ref`、`--no-deps`、`--jobs`、`--goproxy`；发布前或离线源码验收可使用 `--source-dir /绝对路径/源码`。编译并行度按机器内存与核数自动决定（1.5 GiB 以上放开到核数，1 GiB 上下为 2，768 MiB 以下保持单任务），Go 模块代理先实测连通性再选（默认线路偏慢时自动切到 goproxy.cn），编译前后会打印所用并行度、代理和耗时；完整参数运行 `--help`。重跑保留数据、密码与付款开关。升级有本机健康门禁，失败恢复旧程序及服务配置；不回滚数据库。卸载保留全部数据与密码，不删除系统依赖。备份时必须同时保留 `data/` 和 `secrets/`；历史程序备份位于 `backups/`，由管理员按需要清理。
+默认安装到 `/opt/xgift`，支持 `--dir`、`--port`、`--ref`、`--no-deps`、`--jobs`、`--goproxy`、`--build-from-source`；发布前或离线源码验收可使用 `--source-dir /绝对路径/源码`。
+
+程序来源按以下顺序决定：默认先尝试下载 `--ref`（默认 `main`；打过的 tag 如 `v0.1.0` 亦可）对应的 Release 预编译产物（`xgift-linux-amd64` / `xgift-web-linux-amd64` 及 arm64 版本），经 `SHA256SUMS` 校验后直接使用；下载不到、校验失败或当前架构无产物时回退源码编译。`--build-from-source` 可跳过下载强制在目标机编译，`--source-dir` 使用本机源码。想固定使用某个已发布版本，用 `--ref v0.1.0`。
+
+回退编译时，编译并行度按机器内存与核数自动决定（1.5 GiB 以上放开到核数，1 GiB 上下为 2，768 MiB 以下保持单任务；可用 `--jobs N` 覆盖），Go 模块代理先实测连通性再选（默认线路偏慢时自动切到 `goproxy.cn`，可用 `--goproxy URL` 指定、`--goproxy off` 强制直连），编译前后会打印所用并行度、代理和耗时；完整参数运行 `--help`。重跑保留数据、密码与付款开关。升级有本机健康门禁，失败恢复旧程序及服务配置；不回滚数据库。卸载保留全部数据与密码，不删除系统依赖。备份时必须同时保留 `data/` 和 `secrets/`；历史程序备份位于 `backups/`，由管理员按需要清理。
 
 安装器还会提前检查并明确提示：磁盘与可用内存、域名解析结果（含 IPv6 提醒）、80/443 实际占用者、宿主反代配置是否已包含该域名、安装目录父路径是否允许服务用户遍历。发现问题时会在下载和编译之前终止，不会留下改到一半的系统状态。
 
@@ -386,6 +390,7 @@ tools/
   priceprobe/       只读：向 X 询价，核对实际币种与金额
   readfail/         只读：查看 vault 记录与失败审计
 deploy/             交互式 install.sh、CLI 回归、systemd 单元、Caddyfile、site.env 示例
+.github/workflows/  release.yml：打 tag 自动编译并发布预编译产物
 docs/               付款节点池说明
 ```
 
@@ -396,6 +401,16 @@ npm run check        # TypeScript 类型检查
 npm run audit:ui     # Lighthouse 检查
 go test ./...        # 全量测试
 ```
+
+## 发布预编译产物
+
+安装器默认从 Release 取预编译程序，所以**发版时要打 tag 触发 `.github/workflows/release.yml`**：
+
+```sh
+git tag -a v0.1.0 -m 'v0.1.0' && git push origin v0.1.0
+```
+
+工作流会分别在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` 上原生构建（SQLite 驱动依赖 CGO，不能纯 Go 交叉编译），产出静态链接的 `xgift-linux-{amd64,arm64}`、`xgift-web-linux-{amd64,arm64}` 和 `SHA256SUMS`，并在发布前自检产物确为静态链接。也可在 Actions 页面手动 `workflow_dispatch` 触发。没有对应 Release 时，安装器会自动回退源码编译，功能不受影响，只是慢。
 
 ## 许可
 
