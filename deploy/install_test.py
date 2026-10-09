@@ -282,21 +282,47 @@ class InstallerCLI(unittest.TestCase):
         self.assertIn('cp "$BACKUP/$name" "$ROOT/$name"', source)
 
     def test_upgrade_bootstrap_downloads_requested_ref(self):
-        import re
+        """升级自举必须优先用 install.conf 里记的 ref，而不是命令行上还没解析的值。
+
+        踩过的坑：自举用默认的 main（或用户传的旧 tag）去拉安装器，会拉回一个
+        带已知 bug 的旧版本，于是每次升级都原地复现同一个失败。
+        """
         source = SCRIPT.read_text()
         start = source.index("# An installed entry point")
         end = source.index("log 'XGift 一键安装", start)
         bootstrap = source[start:end]
-        with tempfile.TemporaryDirectory() as directory:
-            fake = Path(directory) / "downloaded.sh"
-            fake.write_text('#!/bin/bash\nprintf "%s\\n" "boot=$XGIFT_BOOTSTRAPPED args=$*"\n')
-            body = (f'ACTION=upgrade; SOURCE_DIR=; DRY=0; ROOT=/opt/xgift; REF=release; REPO=owner/repo; '
-                    f'ORIGINAL_ARGS=(--upgrade --yes); die() {{ exit 7; }}; '
-                    f'curl() {{ printf "URL=%s\\n" "$*"; cp {str(fake)!r} "${{@: -1}}"; }}; {bootstrap}')
-            result = subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + body], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("owner/repo/release/deploy/install.sh", result.stdout)
-            self.assertIn("boot=1 args=--upgrade --yes --dir /opt/xgift --ref release", result.stdout)
+
+        def run(saved_ref, cli_ref, fail_first=False):
+            with tempfile.TemporaryDirectory() as directory:
+                fake = Path(directory) / "downloaded.sh"
+                fake.write_text('#!/bin/bash\nprintf "%s\\n" "boot=$XGIFT_BOOTSTRAPPED args=$*"\n')
+                conf = Path(directory) / "install.conf"
+                conf.write_text(saved_ref)
+                body = (
+                    f'ACTION=upgrade; SOURCE_DIR=; DRY=0; ROOT={str(directory)!r}; '
+                    f'REF={cli_ref}; REPO=owner/repo; SELF=/tmp/self.sh; '
+                    f'ORIGINAL_ARGS=(--upgrade --yes); '
+                    'log() { printf "%s\\n" "$*" >&2; }; die() { exit 7; }; '
+                    f'curl() {{ printf "URL=%s\\n" "$*"; cp {str(fake)!r} "${{@: -1}}"; }}; '
+                    + bootstrap)
+                return subprocess.run(["bash", "-c", "set -Eeuo pipefail\n" + body],
+                                      capture_output=True, text=True)
+
+        # install.conf 记着 release，命令行给的是 main：应优先用 release。
+        result = run("REF=release\n", "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("owner/repo/release/deploy/install.sh", result.stdout)
+        self.assertIn("boot=1 args=--upgrade --yes --dir", result.stdout)
+
+        # 没有任何记录时，退回命令行值。
+        result = run("", "release")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("owner/repo/release/deploy/install.sh", result.stdout)
+
+        # 明确记录了 main 时也要照用（不做额外猜测）。
+        result = run("REF=main\n", "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("owner/repo/main/deploy/install.sh", result.stdout)
 
     def test_caddy_conflict_uses_imported_host_routes(self):
         import json
@@ -646,7 +672,9 @@ echo "files=$left"
         missing = run(f"{digest}  xgift-linux-arm64\n", good)
         self.assertIn("result=fallback", missing.stdout)
 
-        # 清单本身不可达：回退。curl 对任何地址都失败并返回非零。
+        # 清单本身不可达：回退，并且必须说明原因。
+        # 用户看到的下一个动作是满屏 go: downloading，不给原因他会以为
+        # "这个项目必须编译"——其实多数情况只是 ref 取错了。
         unreachable = self.run_function(
             "download_prebuilt",
             'uname() { echo x86_64; }\n'
@@ -656,7 +684,21 @@ echo "files=$left"
             'TMP=$(mktemp -d)\n'
             'if download_prebuilt; then echo "result=ok"; else echo "result=fallback"; fi\n')
         self.assertIn("result=fallback", unreachable.stdout)
-        self.assertIn("没有发布预编译产物", unreachable.stderr)
+        self.assertIn("原因", unreachable.stderr)
+        self.assertIn("编译", unreachable.stderr)
+
+        # REF=main 一定要点明"main 上没有 Release 产物"，这是最常见的误用。
+        main_ref = self.run_function(
+            "download_prebuilt",
+            'uname() { echo x86_64; }\n'
+            'log() { printf "%s\\n" "$*" >&2; }\n'
+            'curl() { local a; for a in "$@"; do case "$a" in *%{http_code}*) echo 404; return 0;; esac; done; return 22; }\n'
+            'REPO=owner/repo; REF=main\n'
+            'TMP=$(mktemp -d)\n'
+            'download_prebuilt || true\n')
+        self.assertIn("main", main_ref.stderr)
+        self.assertIn("--ref", main_ref.stderr)
+        self.assertIn("404", main_ref.stderr)
 
         # 不支持的架构：回退，不尝试下载。
         other = run(sums, good, uname_out="riscv64")

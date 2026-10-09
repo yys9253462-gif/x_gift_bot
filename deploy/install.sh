@@ -7,7 +7,7 @@ REF=
 ORIGINAL_ARGS=("$@")
 ROOT=/opt/xgift
 DOMAIN= PORT= MODE= ACTION=install SOURCE_DIR=
-YES=0 DRY=0 DEPS=1 INTERACTIVE=0 FROM_SOURCE=0
+YES=0 DRY=0 DEPS=1 INTERACTIVE=0 FROM_SOURCE=0 REF_EXPLICIT=
 [[ ! -t 0 ]] || INTERACTIVE=1
 TMP= BACKUP= CADDY_STAGE= CHANGED=0 HAD_SERVICE=0
 SELF=$(realpath "${BASH_SOURCE[0]}")
@@ -73,7 +73,7 @@ while (($#)); do
       (($# >= 2)) || die "$1 缺少参数"
       case "$1" in
         --domain) DOMAIN=$2;; --port) PORT=$2;; --https) MODE=$2;;
-        --dir) ROOT=$2;; --ref) REF=$2;; --source-dir) SOURCE_DIR=$2;;
+        --dir) ROOT=$2;; --ref) REF=$2; REF_EXPLICIT=1;; --source-dir) SOURCE_DIR=$2;;
         --goproxy) GOPROXY_OVERRIDE=$2;; --jobs) JOBS_OVERRIDE=${2//[[:space:]]/}; [[ -n $JOBS_OVERRIDE ]] || die '--jobs 需要 1 以上的整数';;
       esac; shift 2;;
     --yes) YES=1; shift;; --dry-run) DRY=1; shift;; --no-deps) DEPS=0; shift;;
@@ -115,6 +115,8 @@ if [[ -f $ROOT/install.conf ]]; then
   done < "$ROOT/install.conf"
 fi
 REF=${REF:-main}
+# 这里先只用 validate_ref 拦住非法值；"是否要自动解析最新版本"必须等到
+# latest_release_ref 定义之后再判断（shell 函数必须先定义后调用）。
 validate_ref
 MODE=${MODE:-auto}
 [[ $MODE == auto || $MODE == caddy || $MODE == nginx || $MODE == external ]] || die '--https 只能是 auto、caddy、nginx 或 external'
@@ -342,6 +344,37 @@ check_resources() {
   memory=$(awk '/MemAvailable:|SwapFree:/ {sum+=$2} END {print sum}' /proc/meminfo)
   if ((memory < 786432)); then log '提示：可用内存与 swap 合计不足 768 MiB，编译可能被 OOM 杀死；请增加内存或 swap 后重试。'; fi
 }
+# 查最新发布版本的 tag。用于两件事：
+#   1) 用户没写 --ref 时，自动指向有预编译产物的版本，而不是 main（main 没有
+#      Release，必然回退编译）；
+#   2) 取不到产物时报错能给出版本号，而不是让用户自己猜。
+# 走 GitHub API，失败就回显空字符串——绝不能因为这个查询失败就影响安装。
+latest_release_ref() {
+  local tag
+  tag=$(curl -fsSL --max-time 12 --connect-timeout 6 \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("tag_name","") or "")
+except Exception:
+    print("")' 2>/dev/null) || tag=
+  [[ $tag =~ ^[a-zA-Z0-9_./-]+$ && $tag != -* && $tag != *..* ]] || tag=
+  printf '%s' "$tag"
+}
+# 用户没写 --ref、也没有已保存的 REF 时，不要让默认值落在 main 上——main 不带
+# Release 产物，只会默默回退编译，让用户以为"这个项目必须编译"。这里自动指向
+# 最新发布版本，让默认路径就走预编译下载。查询失败就保持 main（退回编译仍能装成）。
+# 放在这里是因为 shell 函数必须先定义后调用。
+if [[ -z $REF_EXPLICIT && $REF == main && -z $SOURCE_DIR && $FROM_SOURCE == 0 ]]; then
+  if resolved=$(latest_release_ref) && [[ -n $resolved ]]; then
+    log "未指定 --ref，已自动选用最新发布版本 $resolved（直接下载预编译产物，无需编译）。"
+    REF=$resolved
+  else
+    log '提示：未指定 --ref，且未能查询到发布版本；默认按 main 处理，可能回退到源码编译。'
+    log "      想跳过编译请显式指定：--ref <版本号>（见 https://github.com/$REPO/releases）"
+  fi
+fi
 # 编译并行度按可用内存与 CPU 核数决定。sing-box 带 QUIC/uTLS 标签，依赖树
 # 预编译二进制：从 GitHub Release 下载并在落盘前强制校验 SHA256。
 # 校验不是可选项——安装器随后会把这些二进制装成 root 服务，一个被替换的
@@ -360,7 +393,23 @@ download_prebuilt() {
   # 任一分支退出都要清掉临时目录，避免半下载的二进制留在磁盘上。
   if ! curl -fSL --retry 2 --retry-max-time 300 --connect-timeout 15 --max-time 300 \
        "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" 2>/dev/null; then
-    log "提示：$REF 没有发布预编译产物（或校验清单不可达），将改为在目标机编译"
+    # 这里必须把「为什么取不到」说清楚。用户看到的下一件事会是满屏 go: downloading，
+    # 如果不说原因，他会以为"这个项目必须编译"——其实只是 ref 取错了。
+    local code
+    code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 20 "$base/SHA256SUMS" 2>/dev/null || echo '000')
+    if [[ $code == 404 ]]; then
+      log "原因：$REF 不是一个带预编译产物的发布版本（HTTP 404）。"
+      if [[ $REF == main ]]; then
+        log '  未指定 --ref 时默认走 main 分支，而 main 上没有 Release 产物。'
+      fi
+      log '  可用版本见：https://github.com/'"$REPO"'/releases'
+      log "  指定发布版本即可无需编译：加 --ref <版本号>（例如 --ref $(latest_release_ref 2>/dev/null || echo v0.1.0)）"
+    elif [[ $code == 000 ]]; then
+      log '原因：无法连接 GitHub（网络不可达或超时），因此取不到预编译产物。'
+    else
+      log "原因：预编译产物不可达（HTTP $code）。"
+    fi
+    log '现在改为在目标机从源码编译，可以装成，但会慢很多。'
     rm -rf -- "$tmp"; return 1
   fi
   for name in xgift xgift-web; do
@@ -556,14 +605,35 @@ if [[ $ACTION == uninstall ]]; then
   exit
 fi
 # An installed entry point must pick up installer fixes before upgrading the application.
+#
+# 关键：升级前先自举一份新安装器再重跑。但下载地址里的 ref 必须**解析之后**的
+# 值——如果这里用还没解析的 $REF（例如默认的 main，或用户传的旧 tag），就会拉回
+# 一个旧安装器，而旧安装器可能带着已经修掉的 bug，于是每次升级都原地复现。
+# 所以这里优先用 install.conf 里记的 REF（那是上次真正装成功的版本），
+# 其次才是命令行值。
 if [[ $ACTION == upgrade && -z $SOURCE_DIR && $DRY == 0 && ${XGIFT_BOOTSTRAPPED:-0} != 1 ]]; then
   command -v curl >/dev/null || die '升级需要 curl'
+  UPDATE_REF=$REF
+  if [[ -f $ROOT/install.conf ]]; then
+    while IFS='=' read -r key value; do
+      case "$key" in REF) [[ -n $value ]] && UPDATE_REF=$value;; esac
+    done < "$ROOT/install.conf"
+  fi
   UPDATE_TMP=$(mktemp -d)
   trap 'rm -rf -- "$UPDATE_TMP"' EXIT
-  curl -fSL --retry 2 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
-    "https://raw.githubusercontent.com/$REPO/$REF/deploy/install.sh" -o "$UPDATE_TMP/install.sh"
-  bash -n "$UPDATE_TMP/install.sh" || die '下载的安装器未通过语法检查'
-  XGIFT_BOOTSTRAPPED=1 bash "$UPDATE_TMP/install.sh" "${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"
+  # 拉取顺序：先试自举 ref，失败再试 main（修复总是先合进 main）。
+  for candidate in "$UPDATE_REF" main; do
+    [[ -n $candidate ]] || continue
+    if curl -fSL --retry 2 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+         "https://raw.githubusercontent.com/$REPO/$candidate/deploy/install.sh" -o "$UPDATE_TMP/install.sh" 2>/dev/null \
+       && bash -n "$UPDATE_TMP/install.sh" 2>/dev/null; then
+      log "升级前已取得安装器（$candidate）。"
+      XGIFT_BOOTSTRAPPED=1 bash "$UPDATE_TMP/install.sh" "${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"
+      exit
+    fi
+  done
+  log '提示：未能取得新安装器，改用当前文件继续升级。'
+  XGIFT_BOOTSTRAPPED=1 bash "$SELF" "${ORIGINAL_ARGS[@]}" --dir "$ROOT"
   exit
 fi
 log 'XGift 一键安装：自动准备程序和服务，随后在浏览器中完成账号与支付配置。'
@@ -593,7 +663,7 @@ if [[ -z $PORT ]]; then
   fi
 fi
 log "计划：版本 $REF；目录 $ROOT；域名 $DOMAIN；监听 127.0.0.1:$PORT；HTTPS $MODE"
-log '将自动安装编译依赖，构建带 with_quic,with_utls 标签的两个程序，生成首次密码并启动 systemd。'
+log "将优先进口已发布的预编译程序（$REF）；仅在取不到时才回退到本机编译。随后生成首次密码并启动 systemd。"
 if ((DRY)); then log 'dry-run：未写文件，未安装依赖，未操作服务。'; exit 0; fi
 [[ $EUID == 0 ]] || die '请以 root 运行；已有 sudo 则用 sudo bash install.sh，否则先 su -'
 [[ -d /run/systemd/system ]] || die '需要使用 systemd 的 Linux 服务器'
@@ -763,6 +833,16 @@ stage_assets() {
         --retry-delay 2 --retry-all-errors "$base/$asset" -o "$src_dir/$asset" 2>/dev/null \
         || return 1
     done
+    # 旧发布版本里冻结的 install.sh 可能是修复前的版本（例如仍从 $TMP/src/deploy
+    # 读单元文件）。把它装成 $ROOT/install.sh 会让用户下次升级又踩同一个坑。
+    # 这里做一次自检：下载到的安装器必须能通过语法检查，且必须认识 $TMP_ASSETS
+    # 这套路径约定；不合格就退回正在运行的自己。systemd 单元没有这个问题，
+    # 它只是路径替换的模板。
+    if ! bash -n "$src_dir/install.sh" 2>/dev/null \
+       || ! grep -q 'TMP_ASSETS' "$src_dir/install.sh"; then
+      log "提示：$REF 里的安装器是旧版本，改用当前运行的安装器写入 $ROOT（避免下次升级重复踩坑）。"
+      cp "$SELF" "$src_dir/install.sh"
+    fi
   fi
   [[ -f $src_dir/xgift.service && -f $src_dir/install.sh ]] || return 1
   cp "$src_dir/xgift.service" "$src_dir/install.sh" "$TMP_ASSETS/"
