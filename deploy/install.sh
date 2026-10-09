@@ -27,6 +27,8 @@ XGift 交互式安装器（Debian/Ubuntu + systemd，amd64/arm64）
   --yes                  非交互确认；必须指定或已有域名
   --dry-run              只检查并打印计划，不写文件、不装依赖
   --no-deps              不自动安装系统依赖
+  --goproxy URL          Go 模块代理；off 表示只用直连
+  --jobs N               覆盖自动选择的编译并行任务数
   --upgrade              重新构建并升级，失败恢复旧程序和服务配置
   --status               查看服务状态，不安装依赖
   --uninstall            移除服务及本安装器的反代块，保留目录和全部数据
@@ -37,11 +39,12 @@ HELP
 }
 while (($#)); do
   case "$1" in
-    --domain|--port|--https|--dir|--ref|--source-dir)
+    --domain|--port|--https|--dir|--ref|--source-dir|--goproxy|--jobs)
       (($# >= 2)) || die "$1 缺少参数"
       case "$1" in
         --domain) DOMAIN=$2;; --port) PORT=$2;; --https) MODE=$2;;
         --dir) ROOT=$2;; --ref) REF=$2;; --source-dir) SOURCE_DIR=$2;;
+        --goproxy) GOPROXY_OVERRIDE=$2;; --jobs) JOBS_OVERRIDE=${2//[[:space:]]/}; [[ -n $JOBS_OVERRIDE ]] || die '--jobs 需要 1 以上的整数';;
       esac; shift 2;;
     --yes) YES=1; shift;; --dry-run) DRY=1; shift;; --no-deps) DEPS=0; shift;;
     --upgrade|--status|--uninstall)
@@ -247,6 +250,70 @@ check_resources() {
   memory=$(awk '/MemAvailable:|SwapFree:/ {sum+=$2} END {print sum}' /proc/meminfo)
   if ((memory < 786432)); then log '提示：可用内存与 swap 合计不足 768 MiB，编译可能被 OOM 杀死；请增加内存或 swap 后重试。'; fi
 }
+# 编译并行度按可用内存与 CPU 核数决定。sing-box 带 QUIC/uTLS 标签，依赖树
+# 很大，单核编译在正常配置的机器上要慢一个数量级；而在 1 GiB 无 swap 的小机
+# 上放开并行又会被 OOM 杀死。所以两边都要看，而不是写死。
+#   1.5 GiB 及以上：放开到 CPU 核数（上限 8），这是普通 VPS 和家用机的常态。
+#   1 GiB 上下：折中为 2。
+#   768 MiB 及以下：保持单编译任务 + GOMAXPROCS=1。
+plan_build_parallelism() {
+  local memory cpus jobs
+  memory=$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo)
+  cpus=$(nproc 2>/dev/null || echo 1)
+  ((cpus >= 1)) || cpus=1
+  if [[ -n ${JOBS_OVERRIDE:-} ]]; then
+    [[ $JOBS_OVERRIDE =~ ^[0-9]+$ ]] && ((JOBS_OVERRIDE >= 1)) || die "--jobs 需要 1 以上的整数"
+    jobs=$JOBS_OVERRIDE
+    log "编译并行度：${jobs} 任务（由 --jobs 指定；可用内存 ${memory} kB，过大可能被 OOM 杀死）"
+  elif ((memory >= 1572864)); then jobs=$cpus
+  elif ((memory >= 1048576)); then jobs=2
+  else jobs=1
+  fi
+  ((jobs > 8)) && jobs=8
+  ((jobs < 1)) && jobs=1
+  if ((jobs == 1)); then
+    BUILD_JOBS=1
+    export GOMAXPROCS=1 GOMEMLIMIT=384MiB
+    log "编译并行度：单任务（可用内存与 swap 合计 ${memory} kB，机器较小；如需更快可加 swap 后重跑）"
+  else
+    BUILD_JOBS=$jobs
+    # GOMEMLIMIT 只设上限而非配额，留给链接器和其余进程余量。
+    export GOMAXPROCS=$jobs GOMEMLIMIT=$((memory * 3 / 4))
+    log "编译并行度：${jobs} 任务（${cpus} 核，可用内存 ${memory} kB）"
+  fi
+}
+# Go 模块默认走 proxy.golang.org。实测同一台美国机器上它只要 0.08s，而
+# goproxy.cn 要 1.56s——把国内镜像设成无条件默认会让境外机器反而更慢。
+# 但国内线路访问 proxy.golang.org 会退化到逐个模块串行等待，sing-box 依赖树
+# 有几百个模块（含 QUIC、Caddy server、chromium 内核），拖到几十分钟很常见。
+# 所以先各测一次连通性，再选快的那条；两个都通但都不快就退回默认链。
+setup_go_proxy() {
+  if [[ -n ${GOPROXY_OVERRIDE:-} ]]; then
+    if [[ $GOPROXY_OVERRIDE != off ]]; then export GOPROXY="$GOPROXY_OVERRIDE"; fi
+    return 0
+  fi
+  # 用户已设置则保留原值。用 if 而非 `[[ ]] || return`：后者在 set -e 下
+  # 条件为假时会让整个函数以非零状态退出，安装随之中断。
+  if [[ -n ${GOPROXY:-} ]]; then return 0; fi
+  local probe url fastest= best=
+  for url in 'https://proxy.golang.org' 'https://goproxy.cn'; do
+    probe=$(curl -fsS --max-time 8 -o /dev/null -w '%{time_total}' \
+      "$url/github.com/quic-go/quic-go/@v/list" 2>/dev/null || echo '')
+    if [[ -n $probe ]] && { [[ -z $fastest ]] || awk "BEGIN{exit !($probe < $fastest)}"; }; then
+      fastest=$probe; best=$url
+    fi
+  done
+  if [[ -z $best ]]; then
+    export GOPROXY='direct'
+    log '提示：两个 Go 模块代理都探测失败，已改为直连；如下载变慢可加 --goproxy https://goproxy.cn'
+  elif awk "BEGIN{exit !($fastest > 0.8)}"; then
+    export GOPROXY='https://goproxy.cn,https://goproxy.io,direct'
+    log "Go 模块代理：goproxy.cn → goproxy.io → 直连（默认线路实测 ${fastest}s，偏慢）"
+  else
+    export GOPROXY="$best,direct"
+    log "Go 模块代理：${best}（实测 ${fastest}s）"
+  fi
+}
 rollback() {
   local rc=$?
   trap - EXIT INT TERM
@@ -448,11 +515,16 @@ if [[ ! -x $GO_HOME/bin/go ]]; then
   mv "$TMP/go" "$GO_HOME"
 fi
 export PATH="$GO_HOME/bin:$PATH" CGO_ENABLED=1
-# Bounded compiler parallelism for small VPS machines; never change host swap automatically.
-export GOMAXPROCS=1 GOMEMLIMIT=384MiB
+# Parallelism and module proxy are chosen for the machine, not fixed at the
+# values a 1 GiB VPS needs. Never change host swap automatically.
+plan_build_parallelism
+setup_go_proxy
 export GOPATH="$ROOT/build-cache/gopath" GOCACHE="$ROOT/build-cache/go-build"
 mkdir "$TMP/bin"
-(cd "$TMP/src"; go build -p 1 -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p 1 -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
+log "开始编译（首次安装需拉取 sing-box 依赖树，耗时取决于网络；进度见下方 go downloading 输出）"
+START_BUILD=$(date +%s)
+(cd "$TMP/src"; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p "$BUILD_JOBS" -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
+log "编译完成，用时 $(( $(date +%s) - START_BUILD )) 秒"
 # Stage and validate the reverse proxy before touching the running application.
 if [[ $MODE == caddy ]]; then
   CADDY_STAGE=$(mktemp /etc/caddy/.xgift-stage-XXXXXX)

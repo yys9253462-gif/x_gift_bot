@@ -337,6 +337,130 @@ class InstallerCLI(unittest.TestCase):
         result = self.run_function('nginx_domain_conflict', 'NGINX_FILE=/etc/nginx/owned.conf; DOMAIN=gift.example.com; nginx() { return 1; }; nginx_domain_conflict')
         self.assertEqual(result.returncode, 2)
 
+    def test_build_parallelism_scales_with_machine(self):
+        """按机器规格选并行度：小机保持单任务，大机不再被硬编码成单核。"""
+        source = SCRIPT.read_text()
+        # 旧写法在执行路径上把 1 GiB 测试机的限制写死，所有机器都按单核编译。
+        # 小机分支里仍应保留 GOMAXPROCS=1，所以只断言执行路径不再硬编码。
+        main_path = source[source.index("export PATH="):source.index("# Stage and validate the reverse proxy")]
+        self.assertNotIn("GOMAXPROCS=1", main_path)
+        self.assertNotIn("GOMEMLIMIT=384MiB", main_path)
+        self.assertNotIn("go build -p 1 -tags", source)
+        self.assertIn('go build -p "$BUILD_JOBS" -tags', main_path)
+        self.assertIn("MemTotal", source)
+        self.assertIn("nproc", source)
+
+        def parallel_jobs(memtotal_kb, cpus):
+            # awk is shadowed so the decision reads a fixture instead of the real
+            # /proc/meminfo; the installer itself must not gain a test hook.
+            body = (f'awk() {{ echo {memtotal_kb}; }}; nproc() {{ echo {cpus}; }}; '
+                    'BUILD_JOBS=; die() { exit 7; }; log() { :; }; '
+                    'plan_build_parallelism; echo "jobs=$BUILD_JOBS memlimit=$GOMEMLIMIT procs=$GOMAXPROCS"')
+            return self.run_function('plan_build_parallelism', body)
+
+        # 1.5 GiB 以上放开到核数：3.8 GB / 3 核的机器不应再按单核编译。
+        big = parallel_jobs(3900000, 3)
+        self.assertEqual(big.returncode, 0, big.stderr)
+        self.assertIn("jobs=3", big.stdout)
+        self.assertIn("procs=3", big.stdout)
+        # 1 GiB 上下折中为 2。
+        mid = parallel_jobs(1048576, 8)
+        self.assertEqual(mid.returncode, 0, mid.stderr)
+        self.assertIn("jobs=2", mid.stdout)
+        # 小机仍然单任务，不能因为放开并行把 945 MB 测试机 OOM 掉。
+        small = parallel_jobs(945000, 2)
+        self.assertEqual(small.returncode, 0, small.stderr)
+        self.assertIn("jobs=1", small.stdout)
+        self.assertIn("memlimit=384MiB", small.stdout)
+        # 核数上限 8，避免在 64 核机器上把内存打爆。
+        huge = parallel_jobs(64000000, 64)
+        self.assertIn("jobs=8", huge.stdout)
+
+    def test_jobs_override_is_validated(self):
+        def run(override):
+            return self.run_function(
+                'plan_build_parallelism',
+                'nproc() { echo 3; }; BUILD_JOBS=; die() { exit 7; }; log() { :; }; '
+                f'JOBS_OVERRIDE={override!r}; plan_build_parallelism; echo "jobs=$BUILD_JOBS"')
+
+        for bad in ["0", "-1", "abc"]:
+            self.assertEqual(run(bad).returncode, 7, f"--jobs {bad!r} should be rejected")
+        good = run("6")
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertIn("jobs=6", good.stdout)
+        # 空值在参数解析阶段就必须报错：--jobs "" 被静默忽略等于用户以为
+        # 设了并行度，实际仍按自动值编译。
+        result = self.run_cli("--dry-run", "--yes", "--dir", "/opt/xgift-jobs-test", "--jobs", "")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--jobs", result.stderr)
+
+    def test_goproxy_probes_before_choosing(self):
+        """不能无条件用国内镜像：同一台美国机器上 goproxy.cn 比默认慢 19 倍。"""
+        source = SCRIPT.read_text()
+        self.assertIn("goproxy.cn", source)
+        self.assertIn("proxy.golang.org", source)
+        self.assertIn("time_total", source)
+
+        def run(env, override=None, default_time=None, cn_time=None):
+            # curl is shadowed so each candidate can be given a synthetic latency.
+            # The stub prints the mapped latency for a known host and fails the rest.
+            mapping = []
+            if default_time is not None:
+                mapping.append(f'"proxy.golang.org" {default_time}')
+            if cn_time is not None:
+                mapping.append(f'"goproxy.cn" {cn_time}')
+            stub = "curl() { local u=${@: -1}; "
+            for needle, value in [("proxy.golang.org", default_time), ("goproxy.cn", cn_time)]:
+                if value is not None:
+                    stub += f'case "$u" in *{needle}*) echo {value}; return 0;; esac; '
+            stub += "return 1; }; "
+            body = (f"GOPROXY={env}; log() {{ :; }}; "
+                    + (f"GOPROXY_OVERRIDE={override!r}; " if override is not None else "GOPROXY_OVERRIDE=; ")
+                    + stub
+                    + "setup_go_proxy; echo \"proxy=${GOPROXY:-<unset>}\"")
+            return self.run_function('setup_go_proxy', body)
+
+        # 默认线路快：保持默认，不要被国内镜像拖慢。
+        fast = run("''", default_time="0.08", cn_time="1.56")
+        self.assertEqual(fast.returncode, 0, fast.stderr)
+        self.assertIn("proxy=https://proxy.golang.org,direct", fast.stdout)
+
+        # 默认线路慢（国内常见）：切到 goproxy.cn 完整链，不走单点。
+        slow_default = run("''", default_time="9.0", cn_time="0.46")
+        self.assertEqual(slow_default.returncode, 0, slow_default.stderr)
+        self.assertIn("proxy=https://goproxy.cn,direct", slow_default.stdout)
+
+        # 两个代理都慢：走国内镜像链并保留 goproxy.io 兜底。
+        all_slow = run("''", default_time="9.0", cn_time="4.0")
+        self.assertIn("proxy=https://goproxy.cn,https://goproxy.io,direct", all_slow.stdout)
+
+        # 只有国内镜像可达：也要能切过去。
+        cn_only = run("''", cn_time="0.46")
+        self.assertIn("proxy=https://goproxy.cn,direct", cn_only.stdout)
+
+        # 两个都失败：退回直连并给出可操作提示，而不是硬编码一个连不上的代理。
+        neither = run("''")
+        self.assertEqual(neither.returncode, 0, neither.stderr)
+        self.assertIn("proxy=direct", neither.stdout)
+
+        # 用户已设置 GOPROXY 时不得覆盖。
+        keep = run("https://internal.example/proxy", default_time="9.0", cn_time="0.46")
+        self.assertIn("proxy=https://internal.example/proxy", keep.stdout)
+        # 显式 off 关闭镜像：不导出 GOPROXY，让 Go 用 direct 默认值。
+        off = run("''", "off", default_time="9.0")
+        self.assertEqual(off.returncode, 0, off.stderr)
+        self.assertIn("proxy=<unset>", off.stdout)
+        # 显式自定义生效，且不触发探测。
+        custom = run("''", "https://goproxy.io,direct", default_time="9.0")
+        self.assertIn("proxy=https://goproxy.io,direct", custom.stdout)
+
+    def test_build_flags_are_documented_and_forwarded(self):
+        source = SCRIPT.read_text()
+        self.assertIn("--goproxy", source)
+        self.assertIn("--jobs", source)
+        # 升级重入必须带上原参数，否则 --jobs/--goproxy 会在 bootstrap 时丢失。
+        self.assertIn('"${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"', source)
+
     def test_lf(self):
         self.assertNotIn(b"\r", SCRIPT.read_bytes())
 
