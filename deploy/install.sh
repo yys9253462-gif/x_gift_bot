@@ -3,11 +3,13 @@
 set -Eeuo pipefail
 umask 077
 REPO=yys9253462-gif/x_gift_bot
-REF=main
+REF=
+ORIGINAL_ARGS=("$@")
 ROOT=/opt/xgift
 DOMAIN= PORT= MODE= ACTION=install SOURCE_DIR=
-YES=0 DRY=0 DEPS=1
-TMP= BACKUP= CHANGED=0 HAD_SERVICE=0
+YES=0 DRY=0 DEPS=1 INTERACTIVE=0
+[[ ! -t 0 ]] || INTERACTIVE=1
+TMP= BACKUP= CADDY_STAGE= CHANGED=0 HAD_SERVICE=0
 SELF=$(realpath "${BASH_SOURCE[0]}")
 if [[ -f "$(dirname "$SELF")/install.conf" ]]; then ROOT=$(dirname "$SELF"); fi
 log() { printf '%s\n' "$*" >&2; }
@@ -48,21 +50,38 @@ while (($#)); do
     --help|-h) usage; exit 0;; *) die "未知参数 $1；运行 --help 查看用法";;
   esac
 done
-[[ $ROOT =~ ^/[a-zA-Z0-9_/-]+$ && $ROOT != / && $ROOT != */../* && $ROOT != */.. ]] || die '安装目录必须是无空格的绝对路径，且不能包含 ..'
-[[ $REF =~ ^[a-zA-Z0-9_./-]+$ && $REF != -* ]] || die '非法仓库版本'
+[[ $ROOT == /* && $ROOT != *$'\n'* && $ROOT != *' '* ]] || die '安装目录必须是无空格的绝对路径'
+[[ $ROOT != *'..'* ]] || die '安装目录不能包含 ..'
+# Reject aliases of "/" such as "//" and "///" before anything is written:
+# they resolve to the filesystem root and would chmod it and drop files in /bin.
+ROOT_CANON=$(realpath -m -- "$ROOT")
+[[ $ROOT_CANON != / ]] || die '安装目录不能是根目录及其别名（/、//），请使用 /opt/xgift'
+for blocked in /bin /sbin /lib /lib32 /lib64 /libx32 /usr /etc /boot /dev /proc /sys /run /root /home /mnt /media /srv /var; do
+  [[ $ROOT_CANON != "$blocked" && $ROOT_CANON != "$blocked"/* ]] || die "安装目录不能位于系统路径（$blocked）下，请改用 /opt/xgift；当前解析为 $ROOT_CANON"
+done
+ROOT=$ROOT_CANON
+validate_ref() {
+  [[ $REF =~ ^[a-zA-Z0-9_./-]+$ && $REF != -* && $REF != *..* ]] || die '非法仓库版本'
+}
 if [[ -n $SOURCE_DIR ]]; then
   [[ $SOURCE_DIR == /* && -f $SOURCE_DIR/go.mod && -f $SOURCE_DIR/deploy/install.sh ]] || die '源码目录必须为完整源码的绝对路径'
 fi
 # Saved state supplies defaults only. Never execute a state file as shell code.
+if [[ -e $ROOT/install.conf && ! -r $ROOT/install.conf ]]; then
+  die "无法读取 $ROOT/install.conf（权限不足）；请改用 sudo bash 运行本安装器"
+fi
 if [[ -f $ROOT/install.conf ]]; then
   while IFS='=' read -r key value; do
     case "$key" in
       DOMAIN) [[ -n $DOMAIN ]] || DOMAIN=$value;;
       PORT) [[ -n $PORT ]] || PORT=$value;;
       MODE) [[ -n $MODE ]] || MODE=$value;;
+      REF) [[ -n $REF ]] || REF=$value;;
     esac
   done < "$ROOT/install.conf"
 fi
+REF=${REF:-main}
+validate_ref
 MODE=${MODE:-auto}
 [[ $MODE == auto || $MODE == caddy || $MODE == nginx || $MODE == external ]] || die '--https 只能是 auto、caddy、nginx 或 external'
 NGINX_FILE=/etc/nginx/conf.d/xgift-installer.conf
@@ -95,13 +114,149 @@ managed_config() {
     !inside {print}
   ' /etc/caddy/Caddyfile
 }
+only_listener_owner() {
+  local line names name
+  [[ -n $OWNERS ]] || return 0
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    names=$(grep -oE '"[^" ]+"' <<< "$line" || true)
+    [[ -n $names ]] || return 1
+    while IFS= read -r name; do [[ $name == \"$1\" ]] || return 1; done <<< "$names"
+  done <<< "$OWNERS"
+}
+check_root_parents() {
+  local parent mode
+  parent=$(dirname "$(realpath -m "$ROOT")")
+  while [[ $parent != / ]]; do
+    if [[ -e $parent ]]; then
+      [[ -d $parent ]] || die "安装目录父路径不是目录：$parent"
+      mode=$(stat -c '%a' "$parent")
+      (( (8#$mode & 1) != 0 )) || die "父目录 $parent 不允许服务用户遍历；请改用 /opt/xgift，不会修改您的父目录权限"
+    fi
+    parent=$(dirname "$parent")
+  done
+}
+caddy_domain_conflict() {
+  local adapted check_file
+  # Keep the temporary config beside Caddyfile so relative imports resolve correctly.
+  check_file=$(mktemp /etc/caddy/.xgift-check-XXXXXX)
+  managed_config > "$check_file"
+  if ! adapted=$(caddy adapt --config "$check_file" --adapter caddyfile); then
+    rm -f "$check_file"
+    die '现有 Caddy 配置解析失败，未覆盖'
+  fi
+  rm -f "$check_file"
+  python3 -c 'import json,sys,fnmatch
+host=sys.argv[1]
+def conflict(node):
+    if isinstance(node,dict):
+        if any(fnmatch.fnmatchcase(host, h.lower()) for h in node.get("host",[]) if isinstance(h,str)): return True
+        return any(conflict(v) for v in node.values())
+    if isinstance(node,list): return any(conflict(v) for v in node)
+    return False
+sys.exit(0 if conflict(json.load(sys.stdin)) else 1)' "$DOMAIN" <<< "$adapted"
+}
+nginx_domain_conflict() {
+  local dump
+  dump=$(nginx -T 2>&1) || { printf '%s\n' "$dump" >&2; return 2; }
+  awk -v own="$NGINX_FILE" -v domain="$DOMAIN" '
+    function suffix(host, tail) {return length(host)>length(tail) && substr(host,length(host)-length(tail)+1)==tail}
+    /^# configuration file / {file=$0; sub(/^# configuration file /,"",file); sub(/:$/,"",file); active=0; next}
+    file != own {
+      line=$0; sub(/#.*/,"",line)
+      gsub(/[;{}]/," & ",line); n=split(line,words,/[[:space:]]+/)
+      for (i=1;i<=n;i++) {
+        name=tolower(words[i])
+        if (name=="server_name") {active=1; continue}
+        if (name==";" || name=="{" || name=="}") {active=0; continue}
+        if (!active || name=="") continue
+        if (substr(name,1,1)=="~") {uncertain=1; continue}
+        if (name==domain || (substr(name,1,2)=="*." && suffix(domain,substr(name,2))) ||
+            (substr(name,1,1)=="." && (domain==substr(name,2) || suffix(domain,name))) ||
+            (substr(name,length(name)-1)==".*" && substr(domain,1,length(name)-1)==substr(name,1,length(name)-1))) found=1
+      }
+    }
+    END {
+      if (found) exit 0
+      if (uncertain) {print "发现正则 server_name，无法自动判定域名冲突；请人工核对后使用 --https external 接入原反代。" > "/dev/stderr"; exit 2}
+      exit 1
+    }
+  ' <<< "$dump"
+}
+check_dns() {
+  local addresses
+  addresses=$(python3 -c 'import socket,sys
+try:
+    addresses=sorted({item[4][0] for item in socket.getaddrinfo(sys.argv[1],443,type=socket.SOCK_STREAM)})
+    if not addresses: raise OSError("no addresses")
+    print("\n".join(addresses))
+except OSError as error:
+    print("DNS解析失败："+str(error),file=sys.stderr); sys.exit(1)' "$DOMAIN") || die "域名 $DOMAIN 无法解析；请检查 DNS 后重试，尚未开始源码下载与构建"
+  [[ -n $addresses ]] || die "域名 $DOMAIN 没有解析地址，尚未开始构建"
+  log "DNS 解析结果：$addresses"
+  if [[ $addresses == *:* ]]; then
+    log '检测到 AAAA/IPv6：请确认上述 IPv6 对应本机，且本机 IPv6 入站 80/443 与反代监听可达；错误 AAAA 会导致证书或 HTTPS 失败。不会自动修改 DNS、防火墙或 CDN。'
+  fi
+}
+choose_external() {
+  log "标准端口被其他服务占用：$OWNERS"
+  log '不会强停未知或非 HTTP 服务。若已有 HTTP(S) 反代，请选 external 接入；若为非 HTTP 服务，请改用具有独立公网 80/443 的宿主/入口，external 本身不能将未知协议变成 HTTPS。'
+  if ((INTERACTIVE && !YES)); then
+    confirm '确认改为 external，并由您配置已有 HTTP(S) 入口？' || die '未同意切换 external，未接管已有监听者'
+    MODE=external
+  else
+    die '未自动切换模式；已有 HTTP(S) 入口请显式指定 --https external，否则准备独立公网 HTTPS 入口后重试'
+  fi
+}
+external_instructions() {
+  cat >&2 <<PROXY
+external 接入：以下二选一，合并到已有宿主反代配置；不要同时启用两套，不会自动修改配置。
+Caddy（宿主）：
+$DOMAIN {
+    reverse_proxy 127.0.0.1:$PORT
+}
+Nginx（合并到已有且已配置证书的 HTTPS server 内）：
+location / {
+    proxy_pass http://127.0.0.1:$PORT;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$remote_addr;
+    proxy_buffering off;
+    proxy_read_timeout 120s;
+}
+上游只监听本机。容器中的 127.0.0.1 不是宿主：请使用已有宿主网络/可达宿主地址，先确认连通，不要直接公开程序端口。
+非 HTTP 监听者不能使用以上 HTTP 反代块；请准备独立公网 HTTPS 入口。配置完成后验证 https://$DOMAIN/healthz。
+PROXY
+}
+acquire_lock() {
+  command -v flock >/dev/null || die '缺少 flock；请安装 util-linux 后重试'
+  # Shared lock lives outside ROOT, so no chmod or package-manager changes precede it.
+  exec 9>/run/lock/xgift-installer.lock
+  flock -n 9 || die '另一个安装器正在运行，请等待完成'
+}
+activate_nginx() {
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+}
+check_resources() {
+  local available memory
+  available=$(df -Pk "${TMPDIR:-/tmp}" "$ROOT" | awk 'NR>1 {if(min==0 || $4<min) min=$4} END {print min}')
+  ((available >= 2097152)) || die '编译至少需要 2 GiB 空闲磁盘（临时目录与安装目录），请清理磁盘后重试'
+  memory=$(awk '/MemAvailable:|SwapFree:/ {sum+=$2} END {print sum}' /proc/meminfo)
+  if ((memory < 786432)); then log '提示：可用内存与 swap 合计不足 768 MiB，编译可能被 OOM 杀死；请增加内存或 swap 后重试。'; fi
+}
 rollback() {
   local rc=$?
   trap - EXIT INT TERM
   if ((rc != 0 && CHANGED)); then
     log '安装失败，正在恢复本次替换的程序及服务配置；数据和密码不回滚。'
     systemctl stop xgift >/dev/null 2>&1 || true
-    if [[ -d $BACKUP/bin ]]; then cp -a "$BACKUP/bin/." "$ROOT/bin/"; fi
+    if [[ -d $BACKUP/bin ]]; then cp -a "$BACKUP/bin/." "$ROOT/bin/"; else rm -f "$ROOT/bin/xgift" "$ROOT/bin/xgift-web"; fi
+    for name in install.conf install.sh; do
+      if [[ -f $BACKUP/$name ]]; then cp "$BACKUP/$name" "$ROOT/$name"; else rm -f "$ROOT/$name"; fi
+    done
     if [[ -f $BACKUP/unit ]]; then cp "$BACKUP/unit" /etc/systemd/system/xgift.service; else rm -f /etc/systemd/system/xgift.service; fi
     if [[ -f $BACKUP/env ]]; then cp "$BACKUP/env" "$ROOT/site.env"; fi
     if [[ -f $BACKUP/caddy ]]; then cp "$BACKUP/caddy" /etc/caddy/Caddyfile; caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 && systemctl reload caddy || true; fi
@@ -113,6 +268,7 @@ rollback() {
     if ((HAD_SERVICE)); then systemctl start xgift || true; fi
     log "恢复副本：$BACKUP；首次安装可能留下依赖、目录及密码，可直接重跑。"
   fi
+  [[ -z ${CADDY_STAGE:-} ]] || rm -f -- "$CADDY_STAGE"
   [[ -z $TMP ]] || rm -rf -- "$TMP"
   exit "$rc"
 }
@@ -128,6 +284,7 @@ if [[ $ACTION == uninstall ]]; then
   [[ $EUID == 0 ]] || die '请以 root 运行（sudo bash install.sh --uninstall）'
   [[ -f $ROOT/install.conf ]] || die "没有找到 $ROOT/install.conf"
   confirm '确认卸载服务？全部数据与密码仍会保留' || exit 0
+  acquire_lock
   TMP=$(mktemp -d); trap rollback EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
   if [[ -f /etc/caddy/Caddyfile ]] && grep -qF '# >>> xgift installer >>>' /etc/caddy/Caddyfile; then
     cp /etc/caddy/Caddyfile "$TMP/caddy"
@@ -155,10 +312,29 @@ if [[ $ACTION == uninstall ]]; then
   log "已卸载服务；$ROOT 中的数据、密码和安装器均保留，重装可继续使用。"
   exit
 fi
+# An installed entry point must pick up installer fixes before upgrading the application.
+if [[ $ACTION == upgrade && -z $SOURCE_DIR && $DRY == 0 && ${XGIFT_BOOTSTRAPPED:-0} != 1 ]]; then
+  command -v curl >/dev/null || die '升级需要 curl'
+  UPDATE_TMP=$(mktemp -d)
+  trap 'rm -rf -- "$UPDATE_TMP"' EXIT
+  curl -fSL --retry 2 --retry-max-time 180 --connect-timeout 15 --max-time 60 \
+    "https://raw.githubusercontent.com/$REPO/$REF/deploy/install.sh" -o "$UPDATE_TMP/install.sh"
+  bash -n "$UPDATE_TMP/install.sh" || die '下载的安装器未通过语法检查'
+  XGIFT_BOOTSTRAPPED=1 bash "$UPDATE_TMP/install.sh" "${ORIGINAL_ARGS[@]}" --dir "$ROOT" --ref "$REF"
+  exit
+fi
 log 'XGift 一键安装：自动准备程序和服务，随后在浏览器中完成账号与支付配置。'
 [[ -t 0 ]] || log '当前不是交互终端；显式参数或保存的配置将作为默认值。'
 DOMAIN=$(ask '请输入站点域名（DNS 应已指向本服务器）' "$DOMAIN")
-[[ ${#DOMAIN} -le 253 && $DOMAIN =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]] || die '请输入合法域名，不要带协议、端口或路径'
+DOMAIN=${DOMAIN,,}
+[[ ${#DOMAIN} -le 253 && $DOMAIN =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$ ]] || die '请输入合法域名，不要带协议、端口或路径'
+IFS=. read -ra labels <<< "$DOMAIN"
+for label in "${labels[@]}"; do ((${#label} <= 63)) || die '域名每段不能超过 63 个字符'; done
+if ((DRY)); then
+  log 'dry-run 权限诊断：跳过安装目录父目录权限阻断；实际安装仍要求服务用户能够遍历全部父目录，不会自动修改父目录权限。'
+else
+  check_root_parents
+fi
 if [[ -n $PORT ]]; then
   [[ $PORT =~ ^[0-9]{1,5}$ ]] || die '端口必须为数字'
   PORT=$((10#$PORT))
@@ -180,48 +356,64 @@ if ((DRY)); then log 'dry-run：未写文件，未安装依赖，未操作服务
 [[ -d /run/systemd/system ]] || die '需要使用 systemd 的 Linux 服务器'
 command -v apt-get >/dev/null || die '当前安装器支持 Debian/Ubuntu（apt-get）'
 confirm '确认开始安装/升级？' || exit 0
+acquire_lock
+mkdir -p "$ROOT"
+check_resources
 if ((DEPS)); then
-  apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git build-essential python3 openssl iproute2 util-linux
+  apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ca-certificates curl git build-essential python3 openssl iproute2 util-linux
 fi
 for dep in curl git gcc python3 openssl ss flock; do command -v "$dep" >/dev/null || die "缺少 $dep；重新运行并去掉 --no-deps"; done
 mkdir -p "$ROOT"
 chmod 755 "$ROOT"
-exec 9>"$ROOT/.install.lock"
-flock -n 9 || die '另一个安装器正在运行，请等待完成'
 # Before downloads or service changes, reject non-owned installations and port conflicts.
 if [[ -e /etc/systemd/system/xgift.service && ! -f $ROOT/install.conf ]]; then die '发现非本安装器管理的 xgift 服务，请先迁移，未覆盖'; fi
 if ss -ltnH | awk '{sub(/.*:/,"",$4); print $4}' | grep -qx "$PORT"; then
   [[ -f $ROOT/install.conf ]] && grep -qx "PORT=$PORT" "$ROOT/install.conf" && systemctl is-active --quiet xgift || die "端口 $PORT 已占用"
 fi
-if [[ $MODE == external && -f /etc/caddy/Caddyfile ]] && grep -qF '# >>> xgift installer >>>' /etc/caddy/Caddyfile; then
+if [[ $MODE == external ]] && { { [[ -f /etc/caddy/Caddyfile ]] && grep -qF '# >>> xgift installer >>>' /etc/caddy/Caddyfile; } || { [[ -f $NGINX_FILE ]] && grep -qF '# xgift installer managed' "$NGINX_FILE"; }; }; then
   die '已存在本安装器管理的 HTTPS 配置；请保留 --https auto，或卸载服务后切换 external（数据保留）'
 fi
 OWNERS=$(ss -ltnpH '( sport = :80 or sport = :443 )')
 if [[ $MODE == auto ]]; then
   if [[ -z $OWNERS ]]; then MODE=caddy
-  elif [[ $OWNERS == *'"nginx"'* && $OWNERS != *'"caddy"'* ]]; then MODE=nginx
-  elif [[ $OWNERS == *'"caddy"'* && $OWNERS != *'"nginx"'* ]]; then MODE=caddy
+  elif only_listener_owner nginx; then MODE=nginx
+  elif only_listener_owner caddy; then MODE=caddy
   else
-    log "标准端口被其他服务占用：$OWNERS"
-    die '不会停止已有服务。容器反代或其他程序请使用 --https external 接入原反代；必须释放标准端口才能新建公网 HTTPS。'
+    choose_external
   fi
 fi
+if [[ $MODE == external ]]; then
+  # A consented auto -> external choice must obey the same old-config checks.
+  if { [[ -f /etc/caddy/Caddyfile ]] && grep -qF '# >>> xgift installer >>>' /etc/caddy/Caddyfile; } || { [[ -f $NGINX_FILE ]] && grep -qF '# xgift installer managed' "$NGINX_FILE"; }; then
+    die '已有安装器管理的 HTTPS 配置；请先卸载服务后切换 external（数据保留）'
+  fi
+  external_instructions
+else
+  check_dns
+fi
 if [[ $MODE == caddy ]]; then
-  [[ -z $OWNERS || $OWNERS == *'"caddy"'* ]] || die '标准端口不是 Caddy 管理，不能强制接管'
+  [[ ! -f $NGINX_FILE ]] || ! grep -qF '# xgift installer managed' "$NGINX_FILE" || die '已有安装器管理的 Nginx 配置；请先卸载服务后切换（数据保留）'
+  only_listener_owner caddy || die '标准端口不是 Caddy 管理，不能强制接管'
   if ! command -v caddy >/dev/null; then
     [[ -z $OWNERS ]] || die '标准端口已占用，不能安装第二个网页服务器'
     ((DEPS)) || die '缺少 Caddy；去掉 --no-deps 或选择 --https external'
     DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
   fi
   [[ -f /etc/caddy/Caddyfile ]] || die 'Caddy 配置不存在；请用 --https external'
-  if managed_config | grep -Fq "$DOMAIN"; then die "域名 $DOMAIN 已出现在现有 Caddy 配置中；未覆盖"; fi
+  if caddy_domain_conflict; then die "域名 $DOMAIN 已出现在现有 Caddy 配置中；未覆盖"; fi
 elif [[ $MODE == nginx ]]; then
-  [[ -z $OWNERS || $OWNERS == *'"nginx"'* ]] || die '标准端口不是 Nginx 管理，不能强制接管'
+  [[ ! -f /etc/caddy/Caddyfile ]] || ! grep -qF '# >>> xgift installer >>>' /etc/caddy/Caddyfile || die '已有安装器管理的 Caddy 配置；请先卸载服务后切换（数据保留）'
+  only_listener_owner nginx || die '标准端口不是 Nginx 管理，不能强制接管'
   command -v nginx >/dev/null || die '未发现宿主 Nginx，不能接管容器 Nginx'
   nginx -t
   [[ ! -e $NGINX_FILE ]] || grep -qF '# xgift installer managed' "$NGINX_FILE" || die '目标 Nginx 文件不是安装器创建，未覆盖'
-  if nginx -T 2>&1 | grep -E '^[[:space:]]*server_name' | grep -Fq "$DOMAIN" && [[ ! -f $NGINX_FILE ]]; then die '域名已存在于 Nginx 配置，未覆盖'; fi
+  if nginx_domain_conflict; then
+    die '域名已存在于其他 Nginx 配置，未覆盖'
+  else
+    conflict_status=$?
+    ((conflict_status == 1)) || die '无法可靠判定 Nginx 域名冲突；未覆盖，请人工核对配置或使用 --https external'
+  fi
   if ! command -v certbot >/dev/null; then
     ((DEPS)) || die '缺少 certbot，请去掉 --no-deps'
     DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
@@ -236,16 +428,20 @@ if [[ -n $SOURCE_DIR ]]; then
   mkdir "$TMP/src"
   cp -a "$SOURCE_DIR/." "$TMP/src/"
 else
-  git clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$TMP/src"
+  for attempt in 1 2 3; do
+    if timeout 300 git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$TMP/src"; then break; fi
+    rm -rf -- "$TMP/src"
+    ((attempt < 3)) || die '源码下载失败（3 次，单次限时 300 秒）；检查 GitHub 连通性或使用 --source-dir'
+  done
 fi
 GO_VERSION=$(awk '$1=="go" {gsub(/\r/,"",$2); print $2; exit}' "$TMP/src/go.mod")
 [[ $GO_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'go.mod 的 Go 版本格式不支持'
 case $(uname -m) in x86_64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) die '仅支持 amd64/arm64';; esac
 GO_HOME="$ROOT/toolchains/go$GO_VERSION"
 if [[ ! -x $GO_HOME/bin/go ]]; then
-  curl -fSL --retry 2 --connect-timeout 15 'https://go.dev/dl/?mode=json&include=all' -o "$TMP/go.json"
+  curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 'https://go.dev/dl/?mode=json&include=all' -o "$TMP/go.json"
   SHA=$(python3 -c 'import json,sys; vs=json.load(open(sys.argv[1])); fs=[f for v in vs if v["version"]==sys.argv[2] for f in v["files"] if f["filename"]==sys.argv[3]]; assert len(fs)==1,"Go archive unavailable"; print(fs[0]["sha256"])' "$TMP/go.json" "go$GO_VERSION" "go$GO_VERSION.linux-$ARCH.tar.gz")
-  curl -fSL --retry 2 --connect-timeout 15 "https://go.dev/dl/go$GO_VERSION.linux-$ARCH.tar.gz" -o "$TMP/go.tar.gz"
+  curl -fSL --retry 2 --retry-max-time 900 --connect-timeout 15 --max-time 300 "https://go.dev/dl/go$GO_VERSION.linux-$ARCH.tar.gz" -o "$TMP/go.tar.gz"
   printf '%s  %s\n' "$SHA" "$TMP/go.tar.gz" | sha256sum -c -
   mkdir -p "$ROOT/toolchains"
   tar -xzf "$TMP/go.tar.gz" -C "$TMP"
@@ -259,8 +455,9 @@ mkdir "$TMP/bin"
 (cd "$TMP/src"; go build -p 1 -tags with_quic,with_utls -o "$TMP/bin/xgift" ./cmd/xgift; go build -p 1 -tags with_quic,with_utls -o "$TMP/bin/xgift-web" ./cmd/xgift-web)
 # Stage and validate the reverse proxy before touching the running application.
 if [[ $MODE == caddy ]]; then
-  managed_config > "$TMP/caddy-next"
-  cat >> "$TMP/caddy-next" <<CADDY
+  CADDY_STAGE=$(mktemp /etc/caddy/.xgift-stage-XXXXXX)
+  managed_config > "$CADDY_STAGE"
+  cat >> "$CADDY_STAGE" <<CADDY
 # >>> xgift installer >>>
 $DOMAIN {
     encode zstd gzip
@@ -268,12 +465,13 @@ $DOMAIN {
 }
 # <<< xgift installer <<<
 CADDY
-  caddy validate --config "$TMP/caddy-next" --adapter caddyfile
+  caddy validate --config "$CADDY_STAGE" --adapter caddyfile
 fi
 BACKUP="$ROOT/backups/$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$BACKUP"
 [[ ! -d $ROOT/bin ]] || cp -a "$ROOT/bin" "$BACKUP/bin"
 [[ ! -f $ROOT/site.env ]] || cp "$ROOT/site.env" "$BACKUP/env"
+for name in install.conf install.sh; do [[ ! -f $ROOT/$name ]] || cp "$ROOT/$name" "$BACKUP/$name"; done
 [[ ! -f /etc/systemd/system/xgift.service ]] || cp /etc/systemd/system/xgift.service "$BACKUP/unit"
 [[ ! -f /etc/caddy/Caddyfile ]] || cp /etc/caddy/Caddyfile "$BACKUP/caddy"
 [[ ! -f $NGINX_FILE ]] || cp "$NGINX_FILE" "$BACKUP/nginx"
@@ -314,7 +512,7 @@ for ((i=0;i<30;i++)); do
 done
 ((healthy)) || { journalctl -u xgift -n 30 --no-pager >&2; die '服务未通过健康检查'; }
 if [[ $MODE == caddy ]]; then
-  cp "$TMP/caddy-next" /etc/caddy/Caddyfile
+  cp "$CADDY_STAGE" /etc/caddy/Caddyfile
   systemctl enable --now caddy
   systemctl reload caddy
 elif [[ $MODE == nginx ]]; then
@@ -330,8 +528,7 @@ server {
     location / { proxy_pass http://127.0.0.1:$PORT; proxy_set_header Host \$host; }
 }
 NGINX
-  nginx -t
-  systemctl reload nginx
+  activate_nginx
   certbot certonly --webroot -w "$ROOT/acme" -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --cert-name "xgift-$DOMAIN"
   cat >> "$NGINX_FILE" <<NGINX
 server {
@@ -367,14 +564,17 @@ if [[ $MODE != external ]]; then
   done
   ((tls_ok)) || die '公网 HTTPS 健康检查失败：检查 DNS、云安全组 80/443、AAAA 记录及 CDN 回源；已触发程序/配置回滚'
 fi
-printf 'DOMAIN=%s\nPORT=%s\nMODE=%s\n' "$DOMAIN" "$PORT" "$MODE" > "$ROOT/install.conf"
-install -m 700 "$TMP/src/deploy/install.sh" "$ROOT/install.sh"
+# Publish both files only after staging succeeds; rollback restores both on failure.
+install -m 700 "$TMP/src/deploy/install.sh" "$TMP/install.sh"
+printf 'DOMAIN=%s\nPORT=%s\nMODE=%s\nREF=%s\n' "$DOMAIN" "$PORT" "$MODE" "$REF" > "$TMP/install.conf"
+install -m 700 "$TMP/install.sh" "$ROOT/install.sh"
+install -m 600 "$TMP/install.conf" "$ROOT/install.conf"
 CHANGED=0
 log "安装完成。下一步：打开 https://$DOMAIN/setup，将初始化密码填入网页向导。"
 if [[ ! -s $ROOT/secrets/admin-password ]]; then
   log "初始化密码：$(< "$ROOT/secrets/setup-password")"
 else log '已有管理员配置已保留，请使用原管理员账号。'; fi
-if [[ $MODE == external ]]; then log "请先把 https://$DOMAIN 反代到 http://127.0.0.1:$PORT；不要公开暴露此本机端口。"; fi
+if [[ $MODE == external ]]; then external_instructions; fi
 log '网页向导完成后运行 systemctl restart xgift；保管库密码与 data 目录请一起备份。'
 log "以后：bash $ROOT/install.sh --status | --upgrade | --uninstall"
 log "旧程序备份：$BACKUP。真实付款默认关闭，配置完成后修改 $ROOT/site.env 再重启。"
