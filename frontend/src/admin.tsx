@@ -79,6 +79,7 @@ type Listing = {
   page: number;
   has_more: boolean;
   payments_enabled: boolean;
+  payments_blocked: boolean;
 };
 type Generated = {
   codes: string[];
@@ -402,7 +403,7 @@ function Admin() {
             <Stack direction="row" alignItems="center" spacing={1} sx={{ flexShrink: 0 }}>
               <Chip
                 variant="outlined"
-                color={listing?.payments_enabled ? "success" : "default"}
+                color={listing?.payments_enabled ? "success" : listing?.payments_blocked ? "warning" : "default"}
                 icon={
                   <Box
                     aria-hidden="true"
@@ -411,7 +412,7 @@ function Admin() {
                       height: 7,
                       borderRadius: "50%",
                       ml: 1.25,
-                      bgcolor: listing ? (listing.payments_enabled ? "success.main" : "text.disabled") : "warning.main",
+                      bgcolor: listing ? (listing.payments_enabled ? "success.main" : listing.payments_blocked ? "warning.main" : "text.disabled") : "warning.main",
                     }}
                   />
                 }
@@ -419,6 +420,8 @@ function Admin() {
                   listing
                     ? listing.payments_enabled
                       ? "充值已开放"
+                      : listing.payments_blocked
+                      ? "充值未开放：重启后生效"
                       : "充值入口已暂停"
                     : "正在获取状态"
                 }
