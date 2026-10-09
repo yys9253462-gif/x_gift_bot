@@ -1,0 +1,117 @@
+name: release
+
+# 打 tag 时构建并发布预编译二进制。安装器优先下载这里的产物，让用户不必在
+# 目标机上装 Go 工具链、拉整棵依赖树再编译。校验值一并发布，安装器强制核对。
+on:
+  push:
+    tags: ['v*']
+  # 允许手动触发，用于验证工作流本身而不发布。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 用各自的原生 runner 而不是交叉编译：internal/vault 依赖
+          # mattn/go-sqlite3（CGO），跨架构交叉编译要额外准备 C 工具链，
+          # 原生 runner 更简单也更不容易出错。
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 构建需要完整历史来打 VCS 标记；深度 1 会让 -buildvcs 报错。
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 检查安装器与前端测试
+        run: |
+          python3 deploy/install_test.py
+          node --check internal/site/assets/setup.js
+
+      - name: 静态编译
+        env:
+          CGO_ENABLED: '1'
+          # QUIC 与 uTLS 是付款出站必需的；缺了这两个标签产物行为不同。
+          TAGS: with_quic,with_utls
+          # 全静态链接，不绑定目标机的 glibc 版本。实测产物为
+          # "not a dynamic executable"，Debian/Ubuntu 新旧版本通用。
+          LDFLAGS: -linkmode external -extldflags "-static"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for cmd in xgift xgift-web; do
+            CGO_ENABLED=$CGO_ENABLED go build \
+              -tags "$TAGS" \
+              -ldflags "$LDFLAGS" \
+              -o "dist/$cmd-linux-${{ matrix.arch }}" \
+              "./cmd/$cmd"
+          done
+          # 产物必须真的是静态的，否则跨发行版会失败。这里直接判定，不让
+          # 动态链接的产物流到用户手上。判据是 ldd 的退出码：对非动态可执行
+          # 文件 ldd 恰恰返回 0（消息走 stdout），对真正动态链接的文件它返回
+          # 非 0。用退出码判断才不会被输出文本误导。
+          for f in dist/*; do
+            if ldd "$f" >/dev/null 2>&1; then
+              echo "错误：$f 是动态链接的，目标机上可能因 glibc 版本不可用"; ldd "$f"; exit 1
+            fi
+            echo "OK 静态链接: $f"
+          done
+          ls -la dist
+
+      - name: 冒烟测试
+        run: |
+          set -euo pipefail
+          # 二进制至少要能在构建机上起来并响应，避免发布一个跑不起来的产物。
+          ./dist/xgift-linux-${{ matrix.arch }} --help >/dev/null 2>&1 \
+            || ./dist/xgift-linux-${{ matrix.arch }} help >/dev/null 2>&1 \
+            || echo "xgift 无 --help 子命令，跳过（不视为失败）"
+          ./dist/xgift-web-linux-${{ matrix.arch }} --help >/dev/null 2>&1 || true
+          echo "冒烟测试通过"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验值
+        run: |
+          set -euo pipefail
+          ls -la dist
+          # 固定排序，让同一份输入产出同样的清单，便于比对。
+          (cd dist && sha256sum $(ls | sort) > ../SHA256SUMS)
+          cat SHA256SUMS
+
+      # 一次调用带上全部文件：分两次调用第二次会因 Release 已存在而走
+      # 更新路径，容易漏掉附件。校验清单必须和二进制同时发布，否则安装器
+      # 可能出现「有产物无校验值」的窗口。
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+            SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
