@@ -15,12 +15,10 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"xgift/internal/checkout"
 )
 
-// setupBodyLimit is generous because one submission carries every credential
-// at once, including full billing addresses.
+// setupBodyLimit is shared with admin JSON settings requests, which may include
+// complete node configurations and billing addresses.
 const setupBodyLimit = 64 << 10
 
 // setupPage serves the bootstrap form.
@@ -46,17 +44,17 @@ func (s *server) setupStatus(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]any{"bootstrap": s.bootstrapEnabled()})
 }
 
-// setupApply writes every credential the site needs and only then creates the
-// admin password file. That file is the marker which flips the server out of
-// bootstrap mode on the next start, so a submission that fails halfway leaves
-// a site that is still open for a retry rather than one that looks configured
-// but cannot serve traffic.
+// setupApply creates only the administrator password. Business credentials are
+// configured later through authenticated admin settings, never during bootstrap.
 func (s *server) setupApply(w http.ResponseWriter, r *http.Request) {
 	if !s.bootstrapEnabled() {
 		message(w, 404, "站点已完成初始化。")
 		return
 	}
-	var f credentialForm
+	var f struct {
+		SetupPassword string `json:"setup_password"`
+		AdminPassword string `json:"admin_password"`
+	}
 	if !decodeSetup(w, r, &f) {
 		return
 	}
@@ -65,80 +63,12 @@ func (s *server) setupApply(w http.ResponseWriter, r *http.Request) {
 		message(w, 401, "初始化密码不正确。")
 		return
 	}
-	if err := f.validate(); err != nil {
-		message(w, 400, err.Error())
+	if strings.TrimSpace(f.AdminPassword) != f.AdminPassword || len(f.AdminPassword) < adminMinLength || len(f.AdminPassword) > 256 || strings.ContainsAny(f.AdminPassword, "\r\n\x00") {
+		message(w, 400, "后台密码须为 32–256 字节，不能包含首尾空格、换行或空字符。")
 		return
 	}
-	cookies, err := f.cookiesRecord()
-	if err != nil {
-		message(w, 400, err.Error())
-		return
-	}
-	defer clear(cookies)
-	auth, err := f.apiAuthRecord()
-	if err != nil {
-		message(w, 400, err.Error())
-		return
-	}
-	defer clear(auth)
-	cards, err := f.cardsRecord()
-	if err != nil {
-		message(w, 400, err.Error())
-		return
-	}
-	defer clear(cards)
-	proxyCfg, err := f.proxyRecord()
-	if err != nil {
-		message(w, 400, err.Error())
-		return
-	}
-	defer clear(proxyCfg)
-	catalog, err := f.catalogRecord()
-	if err != nil {
-		message(w, 400, err.Error())
-		return
-	}
-	defer clear(catalog)
-	stripeKey := []byte(strings.TrimSpace(f.StripeKey))
-	defer clear(stripeKey)
-
-	// 只写真正有内容的记录：留空的 Stripe 项若写成空串/nil，
-	// 后面读配置时会拿到「存在但为空」的值，比干脆不存在更难排查。
-	records := []struct {
-		name string
-		raw  []byte
-	}{
-		{"cookies", cookies},
-		{"api-auth", auth},
-		{"proxy", proxyCfg},
-	}
-	if f.paymentsConfigured() {
-		records = append(records, struct {
-			name string
-			raw  []byte
-		}{"stripe-key", stripeKey}, struct {
-			name string
-			raw  []byte
-		}{"catalog", catalog})
-	}
-	for _, record := range records {
-		if err = s.vault.Put(record.name, record.raw); err != nil {
-			// Record names are a fixed internal list, so echoing one is safe.
-			log.Printf("bootstrap write %s failed: %v", record.name, err)
-			message(w, 500, "保存 "+record.name+" 失败，请重试。")
-			return
-		}
-	}
-	if !f.paymentsConfigured() {
-		log.Printf("bootstrap without Stripe: redeem-code-only mode")
-	}
-	// AddCardRecords re-validates every field and refuses the whole batch
-	// before it writes, so an invalid card cannot leave a half-written pool.
-	if _, err = checkout.AddCardRecords(s.vault, cards); err != nil {
-		message(w, 400, "支付卡无效："+err.Error())
-		return
-	}
-	if err = s.writeAdminPassword(f.AdminPassword); err != nil {
+	// Only establish the administrator; business settings belong in the authenticated backend.
+	if err := s.writeAdminPassword(f.AdminPassword); err != nil {
 		if errors.Is(err, errAlreadyInitialised) {
 			message(w, 409, "站点已完成初始化，请重启服务后使用管理后台。")
 			return

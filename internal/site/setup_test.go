@@ -11,6 +11,45 @@ import (
 	"testing"
 )
 
+func TestSetupPasswordOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name, setup, password string
+		status                int
+	}{
+		{"success", "setup-secret", strings.Repeat("a", 32), 200},
+		{"wrong-token", "wrong", strings.Repeat("a", 32), 401},
+		{"short-password", "setup-secret", "short", 400},
+		{"padded-password", "setup-secret", " " + strings.Repeat("a", 32), 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &server{adminPath: filepath.Join(t.TempDir(), "admin-password"), setupHash: sha256.Sum256([]byte("setup-secret"))}
+			s.bootstrap.Store(true)
+			r := httptest.NewRequest("POST", "/api/setup/apply", strings.NewReader(`{"setup_password":"`+tc.setup+`","admin_password":"`+tc.password+`"}`))
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			s.setupApply(w, r)
+			if w.Code != tc.status {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			if tc.status == 200 {
+				// A nil vault proves setup has no business configuration dependency.
+				data, err := os.ReadFile(s.adminPath)
+				if err != nil || string(data) != tc.password+"\n" {
+					t.Fatalf("password not saved: %v", err)
+				}
+				// Supply a fresh body for the duplicate request.
+				r2 := httptest.NewRequest("POST", "/api/setup/apply", strings.NewReader(`{"setup_password":"setup-secret","admin_password":"`+tc.password+`"}`))
+				r2.Header.Set("Content-Type", "application/json")
+				w = httptest.NewRecorder()
+				s.setupApply(w, r2)
+				if w.Code != 409 {
+					t.Fatalf("duplicate status=%d", w.Code)
+				}
+			}
+		})
+	}
+}
+
 func okHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
