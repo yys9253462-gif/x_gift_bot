@@ -70,12 +70,12 @@ npm run preview
 在**目标服务器**运行（Debian/Ubuntu、systemd、amd64/arm64），先把域名 DNS 指向该服务器：
 
 ```sh
-curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main -o /tmp/xgift-install.sh && bash /tmp/xgift-install.sh --ref v0.1.0
+curl -fSL -H 'Accept: application/vnd.github.raw+json' https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main -o /tmp/xgift-install.sh && bash /tmp/xgift-install.sh
 ```
 
 请以 root 登录执行；非 root 用户将最后的 `bash` 改成 `sudo bash`。下载失败时不会继续运行，也不会让下载管道占用交互输入。
 
-> **`--ref v0.1.0` 是关键，不要省略。** 它指定使用已发布的正式版本，安装器据此下载对应架构的预编译程序，通常几十秒装完。若不加 `--ref`，默认跟随 `main` 分支，而 `main` 没有对应的 Release 产物，安装器只能回退到在目标机上从源码编译——耗时数分钟到数十分钟，小内存机器（1 GiB 上下且无 swap）还可能触发 OOM。源码编译依赖 `github.com` 与 `proxy.golang.org` 的连通性，网络不畅时同样会失败。
+> **不用加 `--ref`，安装器会自动选最新发布版本。** 未指定 `--ref` 时，安装器先查询 GitHub 上的最新 Release，用它的版本号直接下载对应架构的预编译程序，通常几十秒装完，**不需要在目标机上编译**。只有在预编译产物确实取不到时（无 Release、无对应架构产物、校验失败、网络不通）才回退源码编译；`--ref <版本号>` 则用于固定使用某个历史版本，详见 [发布版本](https://github.com/yys9253462-gif/x_gift_bot/releases)。
 
 安装器询问域名和确认后，**优先下载官方 GitHub Release 里对应架构的预编译程序**（通常几十秒即可装完，无需在目标机编译）；下载后先核对 `SHA256SUMS` 中的 SHA256，校验不通过或没有匹配架构的产物时，会自动回退到源码编译，不会留下任何未经验证的文件。回退路径会自动安装编译依赖与匹配 `go.mod` 的 Go（官方 SHA256 校验，不替换系统 Go）、构建两个程序。两条路径都会配置 systemd 并生成保管库密码和初始化口令，默认自动选空闲本机端口（从 8787 起）。回退到源码编译时首次构建可能耗时较长（取决于网络与机器）；编译并行度与 Go 内存软限制不等于总内存上限，仍可能遇到 OOM、下载或编译失败。
 
@@ -106,16 +106,16 @@ bash /opt/xgift/install.sh --uninstall
 
 默认安装到 `/opt/xgift`，支持 `--dir`、`--port`、`--ref`、`--no-deps`、`--jobs`、`--goproxy`、`--build-from-source`；发布前或离线源码验收可使用 `--source-dir /绝对路径/源码`。
 
-程序来源按以下顺序决定：默认先尝试下载 `--ref`（默认 `main`；打过的 tag 如 `v0.1.0` 亦可）对应的 Release 预编译产物（`xgift-linux-amd64` / `xgift-web-linux-amd64` 及 arm64 版本），经 `SHA256SUMS` 校验后直接使用；下载不到、校验失败或当前架构无产物时回退源码编译。`--build-from-source` 可跳过下载强制在目标机编译，`--source-dir` 使用本机源码。想固定使用某个已发布版本，用 `--ref v0.1.0`。
+程序来源按以下顺序决定：不指定 `--ref` 时先查询最新 Release 并采用其版本号（查不到则按 `main` 处理）；随后尝试下载该版本对应的 Release 预编译产物（`xgift-linux-amd64` / `xgift-web-linux-amd64` 及 arm64 版本），经 `SHA256SUMS` 校验后直接使用；下载不到、校验失败或当前架构无产物时回退源码编译。失败时会把原因说清楚（例如 `HTTP 404` 表示该 ref 不是带预编译产物的发布版本、`HTTP 000` 表示连不上 GitHub）。`--build-from-source` 可跳过下载强制在目标机编译，`--source-dir` 使用本机源码。想固定使用某个已发布版本，用 `--ref <版本号>`。
 
 回退编译时，编译并行度按机器内存与核数自动决定（1.5 GiB 以上放开到核数，1 GiB 上下为 2，768 MiB 以下保持单任务；可用 `--jobs N` 覆盖），Go 模块代理先实测连通性再选（默认线路偏慢时自动切到 `goproxy.cn`，可用 `--goproxy URL` 指定、`--goproxy off` 强制直连），编译前后会打印所用并行度、代理和耗时；完整参数运行 `--help`。重跑保留数据、密码与付款开关。升级有本机健康门禁，失败恢复旧程序及服务配置；不回滚数据库。卸载保留全部数据与密码，不删除系统依赖。备份时必须同时保留 `data/` 和 `secrets/`；历史程序备份位于 `backups/`，由管理员按需要清理。
 
 安装器还会提前检查并明确提示：磁盘与可用内存、域名解析结果（含 IPv6 提醒）、80/443 实际占用者、宿主反代配置是否已包含该域名、安装目录父路径是否允许服务用户遍历。发现问题时会在下载和编译之前终止，不会留下改到一半的系统状态。
 
-> **升级到新版安装器**：早期版本的安装器不会自动换成本文档描述的新版逻辑。请先重新下载安装脚本，再执行升级（同样建议带上 `--ref v0.1.0`）：
+> **升级到新版安装器**：早期版本的安装器不会自动换成本文档描述的新版逻辑。升级时安装器会优先从 `main` 拉取最新安装器再执行（拉不到才用当前文件），所以直接重新下载脚本并执行升级即可：
 >
 > ```sh
-> curl -fSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main' -o /tmp/xgift-install.sh && sudo bash /tmp/xgift-install.sh --upgrade --ref v0.1.0
+> curl -fSL -H 'Accept: application/vnd.github.raw+json' 'https://api.github.com/repos/yys9253462-gif/x_gift_bot/contents/deploy/install.sh?ref=main' -o /tmp/xgift-install.sh && sudo bash /tmp/xgift-install.sh --upgrade
 > ```
 
 安装器 CLI 回归：`python3 deploy/install_test.py`。完整安装、HTTPS 签发和卸载应在独立 Linux 测试机验收。
