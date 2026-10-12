@@ -58,6 +58,10 @@ func run() error {
 		case len(extra) == 0:
 		case command == "cards" && len(extra) == 1:
 			sub = extra[0]
+		case command == "accounts" && len(extra) <= 2:
+			if len(extra) > 0 {
+				sub = extra[0]
+			}
 		case command == "ops":
 			// ops forwards its own subcommand words to runOps verbatim.
 		default:
@@ -90,7 +94,7 @@ func run() error {
 	pay := f.Bool("pay", false, "pay only at the exact catalog plan total")
 	name := f.String("name", "", "secret name for put")
 	f.Usage = func() {
-		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|billing|cards|import-chrome|put|proxy|check|check-payment-outbounds|ops|resume-payments|username> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put reads one JSON value from stdin (stripe-key: the raw pk_live_ key; catalog: merchant/plan catalog JSON; payment-outbounds: an outbound array; cards: a card array). cards list|add|remove|unblock|rotate manages the encrypted payment card pool. check-payment-outbounds probes public endpoints without paying. ops show|set|reset|probe manages the X GraphQL identifiers without a rebuild.")
+		fmt.Fprintln(f.Output(), "Usage: xgift <setup|init|status|billing|cards|import-chrome|put|proxy|check|check-payment-outbounds|ops|resume-payments|accounts|username> [flags]\nsetup is the interactive first-time wizard; init reads a JSON object from stdin; put reads one JSON value from stdin (stripe-key: the raw pk_live_ key; catalog: merchant/plan catalog JSON; payment-outbounds: an outbound array; cards: a card array). cards list|add|remove|unblock|rotate manages the encrypted payment card pool. check-payment-outbounds probes public endpoints without paying. ops show|set|reset|probe manages the X GraphQL identifiers without a rebuild. accounts list|add|remove manages the X sending-account pool (add reads {label,auth_token,ct0} JSON from stdin).")
 		f.PrintDefaults()
 	}
 	if err := f.Parse(rest); err != nil {
@@ -173,6 +177,8 @@ func run() error {
 		return runOps(v, f.Args()[1:])
 	case "cards":
 		return runCards(v, sub, *last4)
+	case "accounts":
+		return runAccounts(v, sub, f.Args()[1:])
 	case "check-payment-outbounds":
 		failed := false
 		enc := json.NewEncoder(os.Stdout)
@@ -215,17 +221,30 @@ func run() error {
 		fmt.Printf("Billing information saved in encrypted SQLite for %d card(s)\n", n)
 		return nil
 	case "status":
-		for _, n := range []string{"cookies", "proxy"} {
-			b, e := v.Get(n)
-			if e != nil {
-				return fmt.Errorf("record %s is missing; run setup or put --name %s", n, n)
-			}
-			if !json.Valid(b) {
-				return fmt.Errorf("invalid %s JSON", n)
-			}
-			clear(b)
-			fmt.Printf("%s: encrypted record verified\n", n)
+		infos, e := checkout.XAccountStatus(v)
+		if e != nil {
+			return e
 		}
+		if len(infos) == 0 {
+			return checkout.ErrNoXAccount
+		}
+		fmt.Printf("x-accounts: %d configured\n", len(infos))
+		for _, a := range infos {
+			state := "available"
+			if a.CoolingSeconds > 0 {
+				state = fmt.Sprintf("cooling %dm (%s)", (a.CoolingSeconds+59)/60, a.CoolingReason)
+			}
+			fmt.Printf("  %-14s %-12s %-8s %s\n", a.ID, a.Label, a.Tail, state)
+		}
+		b, e := v.Get("proxy")
+		if e != nil {
+			return fmt.Errorf("record proxy is missing; run setup or put --name proxy")
+		}
+		if !json.Valid(b) {
+			return errors.New("invalid proxy JSON")
+		}
+		clear(b)
+		fmt.Println("proxy: encrypted record verified")
 		status, e := checkout.CardsStatus(v)
 		if e != nil {
 			return e
@@ -272,10 +291,19 @@ func run() error {
 			return e
 		}
 		defer clear(b)
-		if e = v.Put("cookies", b); e != nil {
+		authToken, ct0, e := cookiePairFromRecord(b)
+		if e != nil {
 			return e
 		}
-		fmt.Println("X cookies refreshed in encrypted SQLite vault")
+		added, e := checkout.UpsertXAccount(v, "chrome-"+strings.ToLower(*profile), authToken, ct0)
+		if e != nil {
+			return e
+		}
+		if added {
+			fmt.Println("X account added to the pool from Chrome profile", *profile)
+		} else {
+			fmt.Println("X account cookies refreshed in the pool from Chrome profile", *profile)
+		}
 		return nil
 	case "put":
 		switch *name {
@@ -295,7 +323,28 @@ func run() error {
 			}
 			fmt.Printf("Payment outbound pool saved: %d nodes; existing order bindings retained\n", len(nodes))
 			return nil
-		case "proxy", "card", "cookies", "api-auth":
+		case "cookies":
+			// 旧格式单账号记录：解析后 upsert 进账号池，语义与后台添加一致。
+			b, e := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
+			if e != nil {
+				return e
+			}
+			defer clear(b)
+			authToken, ct0, e := cookiePairFromRecord(b)
+			if e != nil {
+				return e
+			}
+			added, e := checkout.UpsertXAccount(v, "", authToken, ct0)
+			if e != nil {
+				return e
+			}
+			if added {
+				fmt.Println("X account added to the pool")
+			} else {
+				fmt.Println("X account cookies refreshed in the pool")
+			}
+			return nil
+		case "proxy", "card", "x-accounts", "api-auth":
 			b, e := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
 			if e != nil {
 				return e
@@ -570,5 +619,91 @@ func runCards(v *vault.Vault, sub, last4 string) error {
 		return nil
 	default:
 		return errors.New("cards expects list, add, remove --last4 XXXX, unblock or rotate")
+	}
+}
+
+// cookiePairFromRecord extracts auth_token/ct0 from the legacy single-account
+// cookies record shape, which is also what chrome.Extract returns.
+func cookiePairFromRecord(b []byte) (string, string, error) {
+	if !json.Valid(b) {
+		return "", "", errors.New("stdin must be valid JSON")
+	}
+	var doc struct {
+		Cookies []struct{ Name, Value string } `json:"cookies"`
+	}
+	if json.Unmarshal(b, &doc) != nil {
+		return "", "", errors.New("stdin must be a cookies record")
+	}
+	var authToken, ct0 string
+	for _, c := range doc.Cookies {
+		switch c.Name {
+		case "auth_token":
+			authToken = c.Value
+		case "ct0":
+			ct0 = c.Value
+		}
+	}
+	if authToken == "" || ct0 == "" {
+		return "", "", errors.New("cookies record is missing auth_token or ct0")
+	}
+	return authToken, ct0, nil
+}
+
+// runAccounts manages the sending-account pool. add reads a JSON object from
+// stdin so a rotated cookie pair never touches argv or shell history.
+func runAccounts(v *vault.Vault, sub string, args []string) error {
+	switch sub {
+	case "list":
+		infos, err := checkout.XAccountStatus(v)
+		if err != nil {
+			return err
+		}
+		if len(infos) == 0 {
+			fmt.Println("no X accounts configured")
+			return nil
+		}
+		for _, a := range infos {
+			state := "available"
+			if a.CoolingSeconds > 0 {
+				state = fmt.Sprintf("cooling %dm (%s)", (a.CoolingSeconds+59)/60, a.CoolingReason)
+			}
+			fmt.Printf("%-14s %-16s %-8s %s\n", a.ID, a.Label, a.Tail, state)
+		}
+		return nil
+	case "add":
+		input, err := io.ReadAll(io.LimitReader(os.Stdin, 1024*1024))
+		if err != nil {
+			return err
+		}
+		defer clear(input)
+		var form struct {
+			Label     string `json:"label"`
+			AuthToken string `json:"auth_token"`
+			CT0       string `json:"ct0"`
+		}
+		if err = json.Unmarshal(input, &form); err != nil {
+			return errors.New("stdin must be a JSON object with label, auth_token and ct0")
+		}
+		added, err := checkout.UpsertXAccount(v, form.Label, form.AuthToken, form.CT0)
+		if err != nil {
+			return err
+		}
+		if added {
+			fmt.Println("X account added to the pool")
+		} else {
+			fmt.Println("X account cookies refreshed in the pool")
+		}
+		return nil
+	case "remove":
+		if len(args) == 0 {
+			return errors.New("accounts remove needs the account id from accounts list")
+		}
+		if err := checkout.RemoveXAccount(v, args[0]); err != nil {
+			return err
+		}
+		fmt.Println("X account removed:", args[0])
+		return nil
+	default:
+		return errors.New("accounts expects list, add or remove <id>")
 	}
 }
