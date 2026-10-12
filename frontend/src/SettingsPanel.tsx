@@ -63,11 +63,21 @@ type CardStatus = {
   cooling_seconds?: number;
 };
 type Plan = { months: number; amount: number; product: string };
+// 发送账号池中的一条。auth_token_tail 是脱敏尾纹，完整令牌不出 vault。
+type XAccount = {
+  id: string;
+  label: string;
+  auth_token_tail: string;
+  has_ct0: boolean;
+  added_at: number;
+  cooling_until: number;
+  cooling_reason?: string;
+  cooling_seconds: number;
+};
 type SettingsView = {
   payments: boolean;
   credentials: {
-    auth_token_tail: string;
-    has_ct0: boolean;
+    accounts: XAccount[];
     authorization_set: boolean;
     user_agent: string;
   };
@@ -188,6 +198,7 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
 
   const [authToken, setAuthToken] = useState("");
   const [ct0, setCT0] = useState("");
+  const [accountLabel, setAccountLabel] = useState("");
   const [authorization, setAuthorization] = useState("");
   const [userAgent, setUserAgent] = useState("");
   // 整段粘贴的原始文本与识别反馈
@@ -225,7 +236,7 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
       setPasteOk(false);
       return;
     }
-    setPasteNote("已识别并填入：" + filled.join("、") + "。确认无误后点「保存凭据」。");
+    setPasteNote("已识别并填入：" + filled.join("、") + "。确认无误后点「保存账号」。");
     setPasteOk(true);
   }, []);
 
@@ -405,6 +416,57 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
     }
   }
 
+  // 添加/刷新一个发送账号。与旧版「合并保存单个账号」不同：每次保存都是
+  // 把一对完整凭据放进池子——相同 auth_token 视为刷新 ct0，新 token 则是
+  // 新账号。因此保存成功后清空表单，避免把同一对凭据重复提交。
+  async function saveAccount() {
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await adminApi<{ added?: boolean }>("/api/admin/settings/credentials", {
+        label: accountLabel,
+        auth_token: authToken,
+        ct0: ct0,
+        authorization: authorization,
+        user_agent: userAgent,
+      });
+      setNotice(result?.added ? "新账号已加入池子，下一次赠送即可轮选到它。" : "账号凭据已刷新。");
+      setAuthToken("");
+      setCT0("");
+      setAccountLabel("");
+      setCookiePaste("");
+      setPasteNote("");
+      setPasteOk(false);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+      submitting.current = false;
+    }
+  }
+
+  async function removeAccount(id: string) {
+    if (submitting.current) return;
+    submitting.current = true;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await adminApi("/api/admin/settings/credentials/remove", { id });
+      setNotice("账号已移除。");
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+      submitting.current = false;
+    }
+  }
+
   async function save(label: string, path: string, body: unknown) {
     if (submitting.current) return;
     submitting.current = true;
@@ -456,13 +518,53 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
         id="settings-credentials"
         icon={<KeyOutlined fontSize="small" />}
         title="X 登录凭据"
-        hint={`当前 auth_token：${view?.credentials.auth_token_tail || "未配置"}；ct0：${view?.credentials.has_ct0 ? "已配置" : "未配置"}。下面留空的字段保持原值不变。`}
+        hint="赠送资格由「发送账号」决定，单账号被 X 限流就会全线停摆。这里管理账号池：每次下单自动轮选可用账号，某个账号被 X 拒绝或会话失效时自动冷却并换号。Authorization 与 User-Agent 为全局共享。"
       >
         <Stack spacing={2}>
+          {/* 账号池清单。每个账号只显示尾纹与状态，完整令牌不出 vault。 */}
+          {(view?.credentials.accounts ?? []).length ? (
+            <Stack spacing={1} sx={{ mb: 2.5 }}>
+              {(view?.credentials.accounts ?? []).map((a) => (
+                <Box
+                  key={a.id}
+                  sx={{
+                    display: "flex", alignItems: "center", gap: 1.5, flexWrap: "wrap",
+                    px: 1.5, py: 1, borderRadius: 1.5, bgcolor: "action.hover",
+                  }}
+                >
+                  <KeyOutlined fontSize="small" sx={{ color: "text.secondary" }} />
+                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontWeight: 600 }}>
+                    {a.label} ··· {a.auth_token_tail}
+                  </Typography>
+                  {!a.has_ct0 && <Chip size="small" color="error" variant="outlined" label="缺 ct0" />}
+                  <Chip
+                    size="small"
+                    variant={a.cooling_seconds > 0 ? "outlined" : "filled"}
+                    color={a.cooling_seconds > 0 ? "warning" : "success"}
+                    label={
+                      a.cooling_seconds > 0
+                        ? `冷却 ${Math.ceil(a.cooling_seconds / 60)} 分钟${a.cooling_reason ? "（" + a.cooling_reason + "）" : ""}`
+                        : "可用"
+                    }
+                  />
+                  <Box sx={{ flex: 1 }} />
+                  <Button size="small" color="error" disabled={busy} onClick={() => void removeAccount(a.id)}>
+                    移除
+                  </Button>
+                </Box>
+              ))}
+            </Stack>
+          ) : (
+            <Alert severity="warning" sx={{ mb: 2.5 }}>
+              账号池是空的，任何赠送都会因「没有可用账号」失败。在下面添加第一个发送账号。
+            </Alert>
+          )}
+
+          <Typography variant="subtitle2">添加账号 / 刷新凭据</Typography>
           {/* 换凭据时逐个抄太费劲，跟引导页一样支持整段粘贴自动拆分。
-              界面上必须说清两件事，否则运营会在这三个动作之间犹豫：
+              界面上必须说清两件事，否则运营会在这几个动作之间犹豫：
               ① 单字段是从上面粘贴自动带出来的，通常不用手填；
-              ② 留空 = 保持原值，不会把已有配置清掉。 */}
+              ② 相同 auth_token = 刷新该账号；新 auth_token = 新账号入池。 */}
           <TextField
             label="粘贴整串 Cookie / JSON（自动填充下面的字段）"
             value={cookiePaste}
@@ -484,29 +586,30 @@ export function SettingsPanel({ section }: { section: SettingsSection }) {
               {pasteNote}
             </Alert>
           )}
-          <Typography variant="body2" color="text.secondary">
-            下面是自动拆出来的字段，也可以在下面直接改。留空保持原值不变。
-          </Typography>
-          <TextField label="auth_token" value={authToken} onChange={(e) => setAuthToken(e.target.value)} autoComplete="off" disabled={busy} helperText="X 登录后的 Bearer 令牌，是识别当前操作账号的依据。" slotProps={{ htmlInput: { spellCheck: false } }} />
+          <TextField
+            label="备注名（可选）"
+            value={accountLabel}
+            onChange={(e) => setAccountLabel(e.target.value)}
+            disabled={busy}
+            helperText="给自己认账号用的，比如「主号」「备胎号」。"
+            slotProps={{ htmlInput: { spellCheck: false } }}
+          />
+          <TextField label="auth_token" value={authToken} onChange={(e) => setAuthToken(e.target.value)} autoComplete="off" disabled={busy} helperText="X 登录后的 Bearer 令牌，是识别账号的依据。" slotProps={{ htmlInput: { spellCheck: false } }} />
           <TextField label="ct0" value={ct0} onChange={(e) => setCT0(e.target.value)} autoComplete="off" disabled={busy} helperText="X 的 CSRF 令牌，与 auth_token 配套，通常一起变。" slotProps={{ htmlInput: { spellCheck: false } }} />
           <Grid cols={2}>
-            <TextField label="Authorization（留空保持原值）" value={authorization} onChange={(e) => setAuthorization(e.target.value)} autoComplete="off" disabled={busy} helperText="完整请求头值，一般是 Bearer <token>。" slotProps={{ htmlInput: { spellCheck: false } }} />
-            <TextField label="User-Agent（留空保持原值）" value={userAgent} onChange={(e) => setUserAgent(e.target.value)} autoComplete="off" disabled={busy} helperText="需与登录时的浏览器一致。" />
+            <TextField label="Authorization（留空保持原值）" value={authorization} onChange={(e) => setAuthorization(e.target.value)} autoComplete="off" disabled={busy} helperText="完整请求头值，一般是 Bearer <token>。全局共享，所有账号共用。" slotProps={{ htmlInput: { spellCheck: false } }} />
+            <TextField label="User-Agent（留空保持原值）" value={userAgent} onChange={(e) => setUserAgent(e.target.value)} disabled={busy} helperText="需与登录时的浏览器一致。全局共享，所有账号共用。" />
           </Grid>
+          <Typography variant="body2" color="text.secondary">
+            相同 auth_token 视为刷新该账号的 ct0；新 auth_token 则作为新账号加入池子。Authorization 与 User-Agent 留空表示保持已保存的值。
+          </Typography>
           <Box>
             <Button
               variant="contained"
               disabled={busy || (!authToken.trim() && !ct0.trim() && !authorization.trim() && !userAgent.trim())}
-              onClick={() =>
-                void save("X 凭据", "/api/admin/settings/credentials", {
-                  auth_token: authToken,
-                  ct0: ct0,
-                  authorization: authorization,
-                  user_agent: userAgent,
-                })
-              }
+              onClick={() => void saveAccount()}
             >
-              保存凭据
+              保存账号
             </Button>
           </Box>
         </Stack>
