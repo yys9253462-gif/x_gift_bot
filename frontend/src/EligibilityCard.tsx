@@ -13,8 +13,8 @@ import {
 import FactCheckRounded from "@mui/icons-material/FactCheckRounded";
 import { request } from "./shared";
 
-// Standalone eligibility probe next to the redemption card: a visitor can
-// verify an X account before involving any redemption code. Advisory only.
+// 前台唯一的入口：只读的赠送资格检测。访客填入 X 用户名即可核实账号当前
+// 能否接收 Premium 赠送，不涉及兑换码、付款或订单，因此可以独立成页。
 export function EligibilityCard() {
   const [username, setUsername] = useState("");
   const [checking, setChecking] = useState(false);
