@@ -32,6 +32,7 @@ import DriveFileMoveOutlined from "@mui/icons-material/DriveFileMoveOutlined";
 import AddRounded from "@mui/icons-material/AddRounded";
 import DownloadRounded from "@mui/icons-material/DownloadRounded";
 import RefreshRounded from "@mui/icons-material/RefreshRounded";
+import RestartAltRounded from "@mui/icons-material/RestartAltRounded";
 import ConfirmationNumberOutlined from "@mui/icons-material/ConfirmationNumberOutlined";
 import { mount, Shell } from "./shared";
 import { AppearanceMenu } from "./AppearanceMenu";
@@ -88,6 +89,10 @@ type Generated = {
   folder: string;
 };
 type Confirmation = { kind: "revoke"; code: Code } | null;
+// The restart dialog is its own dialog (not a Confirmation variant) because it
+// reports progress after the request is accepted: the service drops the
+// connection it is answering on, so the UI has to poll rather than just close.
+type RestartState = "confirm" | "pending" | null;
 function Admin() {
   const [customerSelection, setCustomerSelection] = useState<{
     id: string;
@@ -106,6 +111,8 @@ function Admin() {
   // 连续复制时重置 Snackbar 的自动隐藏计时，避免第二条提示一闪而过。
   const [copySeq, setCopySeq] = useState(0);
   const copying = useRef(false);
+  // Guards the restart poll loop against a double click while the dialog is up.
+  const restarting = useRef(false);
   const [selectedIDs, setSelectedIDs] = useState<string[]>([]);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveTarget, setMoveTarget] = useState("");
@@ -127,6 +134,7 @@ function Admin() {
     null,
   );
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
+  const [restartState, setRestartState] = useState<RestartState>(null);
   const [batchError, setBatchError] = useState(false);
   const [countError, setCountError] = useState(false);
   const [focusTarget, setFocusTarget] = useState<"list" | null>(null);
@@ -270,6 +278,45 @@ function Admin() {
       copying.current = false;
     }
   }
+  // Restarting drops every connection this page holds, including the one the
+  // response travels on — so a successful POST usually surfaces as a network
+  // error, not a clean 200. Treat both as "the service is going down", then wait
+  // for /healthz to answer again. Polling is the only reliable completion signal.
+  async function restartService() {
+    if (restarting.current) return;
+    restarting.current = true;
+    setRestartState("pending");
+    try {
+      await api<{ restarting: boolean }>("/api/admin/restart", {});
+    } catch {
+      // Expected on success. The request being cut is the restart happening.
+    }
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      try {
+        const probe = await fetch("/healthz", { cache: "no-store" });
+        if (probe.ok) {
+          setRestartState(null);
+          setNotice({ text: "服务已重启，页面即将重新加载。", error: false });
+          setTimeout(() => window.location.reload(), 1200);
+          restarting.current = false;
+          return;
+        }
+      } catch {
+        // Still cycling; keep waiting.
+      }
+    }
+    // Out of budget: the service may have failed to come back, so say so plainly
+    // instead of reloading into a dead page.
+    restarting.current = false;
+    setRestartState(null);
+    setNotice({
+      text: "重启后 90 秒内服务未恢复响应。请检查 systemctl status xgift 与 journalctl -u xgift。",
+      error: true,
+    });
+  }
+
   async function generate() {
     if (mutation.current) return;
     mutation.current = true;
@@ -401,6 +448,18 @@ function Admin() {
               </Typography>
             </Box>
             <Stack direction="row" alignItems="center" spacing={1} sx={{ flexShrink: 0 }}>
+              <Tooltip title="重启后，只在启动时读取的设置（付款开关、付款出站）才会重新生效">
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="warning"
+                  startIcon={<RestartAltRounded />}
+                  onClick={() => setRestartState("confirm")}
+                  disabled={restartState === "pending"}
+                >
+                  {restartState === "pending" ? "正在重启…" : "重启服务"}
+                </Button>
+              </Tooltip>
               <Chip
                 variant="outlined"
                 color={listing?.payments_enabled ? "success" : listing?.payments_blocked ? "warning" : "default"}
@@ -1150,6 +1209,47 @@ function Admin() {
             onClick={() => void confirm()}
           >
             {busy ? "正在处理…" : "确认停用"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        disableRestoreFocus={focusTarget !== null}
+        open={restartState !== null}
+        onClose={() => {
+          if (restartState !== "pending") setRestartState(null);
+        }}
+        role="alertdialog"
+        aria-labelledby="restart-dialog-title"
+        aria-describedby="restart-dialog-description"
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle id="restart-dialog-title">重启服务？</DialogTitle>
+        <DialogContent>
+          <DialogContentText id="restart-dialog-description">
+            服务会短暂中断（通常几秒）。重启后，只有在服务启动时才会读取的设置
+            才会生效，例如付款开关与付款出站。
+          </DialogContentText>
+          <DialogContentText sx={{ mt: 1.5 }}>
+            正在处理的订单会被标记为中断，不会自动恢复扣款。请确认当前没有订单
+            正在提交。
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ p: 2 }}>
+          <Button
+            onClick={() => setRestartState(null)}
+            disabled={restartState === "pending"}
+            autoFocus
+          >
+            取消
+          </Button>
+          <Button
+            variant="contained"
+            color="warning"
+            disabled={restartState === "pending"}
+            onClick={() => void restartService()}
+          >
+            {restartState === "pending" ? "正在等待服务恢复…" : "确认重启"}
           </Button>
         </DialogActions>
       </Dialog>
