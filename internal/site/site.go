@@ -349,6 +349,7 @@ func Run(ctx context.Context) error {
 	// first-run page below is conditional.
 	mux.HandleFunc("GET /api/admin/settings", s.admin(s.adminSettings))
 	mux.HandleFunc("POST /api/admin/settings/credentials", s.admin(s.saveCredentials))
+	mux.HandleFunc("POST /api/admin/settings/credentials/remove", s.admin(s.removeCredentials))
 	mux.HandleFunc("GET /api/admin/settings/partner", s.admin(s.partnerKeyStatus))
 	mux.HandleFunc("POST /api/admin/settings/partner", s.admin(s.setPartnerKey))
 	mux.HandleFunc("POST /api/admin/settings/partner/rotate", s.admin(s.rotatePartnerKey))
