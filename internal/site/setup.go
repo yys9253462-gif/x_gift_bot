@@ -175,6 +175,38 @@ func (s *server) setupRestart(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// adminRestart hands the authenticated admin session the same restart the setup
+// page offers. It exists because business settings that only load at boot
+// (payments availability, the embedded proxy) otherwise require shell access to
+// apply, and the backend is where those settings are edited.
+//
+// The exit code is the whole contract: the shipped unit uses Restart=on-failure,
+// so a clean exit would be read as "stopped" and the site would stay down. Exit
+// non-zero so both on-failure and always bring it back.
+//
+// This endpoint deliberately does not touch site.env. It cannot turn payments
+// on by itself — it only re-reads what is already on disk, so a restart triggered
+// here can never enable something the operator did not enable first.
+func (s *server) adminRestart(w http.ResponseWriter, r *http.Request) {
+	// The admin auth already proved the operator may act, so there is nothing to
+	// read from the body; but decode still requires a JSON object, so the caller
+	// sends {} rather than an empty body. Passing a fresh target discards any
+	// fields instead of binding them, keeping this endpoint input-free while
+	// still enforcing the JSON content type and single-value contract.
+	if !decodeSetup(w, r, &struct{}{}) {
+		return
+	}
+	log.Printf("admin requested a restart; exiting non-zero so systemd revives the service")
+	reply(w, 200, map[string]any{"restarting": true})
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		// Indirection so tests can observe the decision without killing the test
+		// binary. A test that let this call os.Exit directly would abort the whole
+		// package run, hiding every other result behind a false failure.
+		s.quit(1)
+	}()
+}
+
 // decodeSetup mirrors decode but with a larger body budget. Unknown fields are
 // still rejected so a renamed form field fails loudly instead of silently
 // storing nothing.

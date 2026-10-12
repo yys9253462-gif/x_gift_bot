@@ -165,6 +165,11 @@ var ErrOperationRejected = errors.New("X returned a GraphQL error envelope for t
 // account change, not a new GraphQL operation identifier.
 var ErrGiftNotAuthorised = errors.New("X says this account is not eligible to gift")
 
+// errAccountAuth marks a dead or rejected session (HTTP 401). Like
+// ErrGiftNotAuthorised it is an account-level fault: the fix is another
+// account, so IsAccountFault routes both into rotation.
+var errAccountAuth = errors.New("X rejected the session credentials")
+
 // Eligibility is read-only: it neither creates a checkout nor submits a payment.
 func Eligibility(ctx context.Context, v *vault.Vault, user string, port int) (string, error) {
 	c, err := newXClient(v, port)
@@ -183,6 +188,9 @@ type xClient struct {
 	regionalHTTP *http.Client
 	headers      http.Header
 	ops          ResolvedOps
+	// account 是本 client 绑定的发送账号（账号池中的一条）。整张订单
+	// 内保持不变；被 X 按账号拒绝时由上层冷却并换号。
+	account *XAccount
 	// closeRegional 释放为区域询价临时启动的付款出口（若启动过）。
 	closeRegional func()
 	// probe 为 true 时，本次创建只为向 X 询问判据：不写创建审计、
@@ -265,7 +273,20 @@ func (c *xClient) oneTimeGiftOp() string {
 	return DefaultOpOneTimeGiftMutation
 }
 
+// newXClient resolves the sending account from the pool (LRU, cooldown
+// aware). Callers that must stay on one account across a whole order — the
+// checkout failover path — build the client directly from their chosen
+// account instead.
 func newXClient(v *vault.Vault, port int) (*xClient, error) {
+	account, err := SelectXAccount(v)
+	if err != nil {
+		return nil, err
+	}
+	return newXClientForAccount(v, port, account)
+}
+
+// newXClientForAccount pins the client to one pool account for its lifetime.
+func newXClientForAccount(v *vault.Vault, port int, account *XAccount) (*xClient, error) {
 	// Resolve the operation table before anything else so an invalid override
 	// fails loudly at construction instead of on a live payment path.
 	ops, e := LoadOps(v)
@@ -281,38 +302,16 @@ func newXClient(v *vault.Vault, port int) (*xClient, error) {
 	if json.Unmarshal(raw, &auth) != nil || !strings.HasPrefix(auth.Authorization, "Bearer ") {
 		return nil, errors.New("invalid X API authentication metadata")
 	}
-	raw, e = v.Get("cookies")
-	if e != nil {
-		return nil, e
-	}
-	defer clear(raw)
-	var state struct {
-		Cookies []struct{ Name, Value, Domain string }
-	}
-	if e = json.Unmarshal(raw, &state); e != nil {
-		return nil, e
-	}
-	h := http.Header{"Authorization": {auth.Authorization}, "User-Agent": {auth.UserAgent}, "Content-Type": {"application/json"}, "Origin": {"https://x.com"}, "X-Twitter-Auth-Type": {"OAuth2Session"}, "X-Twitter-Active-User": {"yes"}, "X-Twitter-Client-Language": {"en"}}
-	found := map[string]bool{}
-	for _, c := range state.Cookies {
-		if c.Domain != ".x.com" && c.Domain != "x.com" {
-			return nil, errors.New("unexpected cookie domain")
-		}
-		if c.Name != "auth_token" && c.Name != "ct0" {
-			return nil, errors.New("unexpected cookie name")
-		}
-		if found[c.Name] || c.Value == "" || strings.ContainsAny(c.Value, "\r\n;") {
-			return nil, errors.New("invalid X cookie")
-		}
-		found[c.Name] = true
-		h.Add("Cookie", c.Name+"="+c.Value)
-		if c.Name == "ct0" {
-			h.Set("X-Csrf-Token", c.Value)
-		}
-	}
-	if !found["ct0"] || !found["auth_token"] {
+	if account == nil || account.AuthToken == "" || account.CT0 == "" {
 		return nil, errors.New("required X cookies missing")
 	}
+	if strings.ContainsAny(account.AuthToken, "\r\n;") || strings.ContainsAny(account.CT0, "\r\n;") {
+		return nil, errors.New("invalid X cookie")
+	}
+	h := http.Header{"Authorization": {auth.Authorization}, "User-Agent": {auth.UserAgent}, "Content-Type": {"application/json"}, "Origin": {"https://x.com"}, "X-Twitter-Auth-Type": {"OAuth2Session"}, "X-Twitter-Active-User": {"yes"}, "X-Twitter-Client-Language": {"en"}}
+	h.Add("Cookie", "auth_token="+account.AuthToken)
+	h.Add("Cookie", "ct0="+account.CT0)
+	h.Set("X-Csrf-Token", account.CT0)
 	// Account checks connect directly. Regional pricing and checkout creation
 	// must share the configured exit because X prices depend on its country.
 	// DisableKeepAlives：这两个 client 随 xClient 存活，但每个 xClient 只服务
@@ -322,7 +321,7 @@ func newXClient(v *vault.Vault, port int) (*xClient, error) {
 		return &http.Client{Transport: &http.Transport{Proxy: proxy, DisableKeepAlives: true, TLSHandshakeTimeout: 15 * time.Second}, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("unexpected X API redirect") }}
 	}
 	p, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
-	return &xClient{http: newClient(nil), regionalHTTP: newClient(http.ProxyURL(p)), headers: h, vault: v, ops: ops.resolve()}, nil
+	return &xClient{account: account, http: newClient(nil), regionalHTTP: newClient(http.ProxyURL(p)), headers: h, vault: v, ops: ops.resolve()}, nil
 }
 func (c *xClient) close() {
 	c.http.CloseIdleConnections()
@@ -494,6 +493,9 @@ func (c *xClient) callOnce(ctx context.Context, user, name, id string, variables
 	}
 	audit.Phase = "response_validation"
 	if res.StatusCode != 200 {
+		if res.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("%w: X %s returned HTTP 401", errAccountAuth, name)
+		}
 		return xHTTPFailure(fmt.Errorf("X %s returned HTTP %d; no payment attempted", name, res.StatusCode), res.StatusCode, res.Header.Get("Retry-After"), mutation)
 	}
 	var envelope struct {

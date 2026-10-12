@@ -66,7 +66,23 @@ type server struct {
 	recoveryMu     sync.Mutex
 	limitsMu       sync.Mutex
 	limits         map[string]limit
+	// exitProcess ends the process when a handler needs systemd to restart it.
+	// It is a field rather than a direct os.Exit call so tests can assert the
+	// restart decision without tearing down the whole test binary.
+	// Nil means "use os.Exit".
+	exitProcess func(int)
 }
+
+// quit ends the process the way the restart endpoints need: non-zero, so the
+// shipped unit's Restart=on-failure (and Restart=always) both bring it back.
+func (s *server) quit(code int) {
+	if s.exitProcess != nil {
+		s.exitProcess(code)
+		return
+	}
+	os.Exit(code)
+}
+
 type limit struct {
 	start time.Time
 	count int
@@ -333,6 +349,7 @@ func Run(ctx context.Context) error {
 	// first-run page below is conditional.
 	mux.HandleFunc("GET /api/admin/settings", s.admin(s.adminSettings))
 	mux.HandleFunc("POST /api/admin/settings/credentials", s.admin(s.saveCredentials))
+	mux.HandleFunc("POST /api/admin/settings/credentials/remove", s.admin(s.removeCredentials))
 	mux.HandleFunc("GET /api/admin/settings/partner", s.admin(s.partnerKeyStatus))
 	mux.HandleFunc("POST /api/admin/settings/partner", s.admin(s.setPartnerKey))
 	mux.HandleFunc("POST /api/admin/settings/partner/rotate", s.admin(s.rotatePartnerKey))
@@ -348,6 +365,11 @@ func Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/admin/settings/outbounds/probe", s.admin(s.probeOutboundNode))
 	mux.HandleFunc("POST /api/admin/settings/outbounds/delete", s.admin(s.deleteOutboundNode))
 	mux.HandleFunc("POST /api/admin/settings/outbounds/pin", s.admin(s.pinOutboundNode))
+	// Boot-time settings (payments availability, the embedded proxy) only apply
+	// on a fresh process, so the admin page needs a way to recycle the service
+	// without shell access. Admin-authenticated on purpose: it is the same
+	// authority that can already change those settings.
+	mux.HandleFunc("POST /api/admin/restart", s.admin(s.adminRestart))
 	if bootstrap {
 		mux.HandleFunc("GET /setup", s.setupPage)
 		mux.HandleFunc("GET /setup.js", s.asset("setup.js", "application/javascript; charset=utf-8"))

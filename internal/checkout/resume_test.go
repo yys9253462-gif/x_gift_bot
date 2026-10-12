@@ -25,6 +25,11 @@ func TestResumeOrderBoundaries(t *testing.T) {
 	if err := v.Put("catalog", []byte(catalog)); err != nil {
 		t.Fatal(err)
 	}
+	// 账号池先放一个旧格式单账号：未付款重跑要先过选号这一关，才会按
+	// 原断言停在 api-auth 缺失上，保住「rerun 会重新走 X 校验」的语义。
+	if err := v.Put("cookies", []byte(`{"cookies":[{"name":"auth_token","value":"test-auth-token","domain":".x.com"},{"name":"ct0","value":"test-ct0","domain":".x.com"}]}`)); err != nil {
+		t.Fatal(err)
+	}
 	base := Record{Username: "recipient", RecipientID: "1234", Months: 6, Amount: 60000, Currency: "USD", ProductID: "prod_TEST6MO", SessionID: "cs_live_Original123", URL: "https://checkout.stripe.com/z/pay/cs_live_Original123", Status: "created", Created: 123}
 	tests := []struct {
 		name        string

@@ -6,7 +6,6 @@ package site
 // ever sent back to the browser.
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -28,10 +27,9 @@ type settingsView struct {
 }
 
 type credentialsView struct {
-	AuthTokenTail   string `json:"auth_token_tail"`
-	HasCT0          bool   `json:"has_ct0"`
-	AuthorizationOn bool   `json:"authorization_set"`
-	UserAgent       string `json:"user_agent"`
+	Accounts        []checkout.XAccountInfo `json:"accounts"`
+	AuthorizationOn bool                    `json:"authorization_set"`
+	UserAgent       string                  `json:"user_agent"`
 }
 
 type stripeView struct {
@@ -63,22 +61,12 @@ func tail(s string) string {
 func (s *server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	view := settingsView{Payments: s.payments, Cards: []checkout.CardStatus{}}
 
-	if raw, err := s.vault.Get("cookies"); err == nil {
-		var doc struct {
-			Cookies []struct{ Name, Value string } `json:"cookies"`
-		}
-		if json.Unmarshal(raw, &doc) == nil {
-			for _, c := range doc.Cookies {
-				switch c.Name {
-				case "auth_token":
-					view.Credentials.AuthTokenTail = tail(c.Value)
-				case "ct0":
-					view.Credentials.HasCT0 = c.Value != ""
-				}
-			}
-		}
-		clear(raw)
+	accounts, err := checkout.XAccountStatus(s.vault)
+	if err != nil {
+		message(w, 500, "读取 X 账号失败。")
+		return
 	}
+	view.Credentials.Accounts = accounts
 	if raw, err := s.vault.Get("api-auth"); err == nil {
 		var headers map[string]string
 		if json.Unmarshal(raw, &headers) == nil {
@@ -123,8 +111,14 @@ func (s *server) adminSettings(w http.ResponseWriter, r *http.Request) {
 // saveCredentials replaces the X cookies and request headers. A blank field
 // keeps the stored value, so an operator can rotate the cookie without having
 // to retype the User-Agent.
+// saveCredentials adds a sending account to the pool, or refreshes the
+// cookies of an existing one (same auth token). The shared request headers
+// stay global: they are identical for every account in practice, and a blank
+// field keeps the stored value so rotating one cookie never discards a
+// hand-edited User-Agent.
 func (s *server) saveCredentials(w http.ResponseWriter, r *http.Request) {
 	var form struct {
+		Label        string `json:"label"`
 		AuthToken     string `json:"auth_token"`
 		CT0           string `json:"ct0"`
 		Authorization string `json:"authorization"`
@@ -133,42 +127,11 @@ func (s *server) saveCredentials(w http.ResponseWriter, r *http.Request) {
 	if !decodeSetup(w, r, &form) {
 		return
 	}
-	if strings.TrimSpace(form.AuthToken) != "" {
-		if err := checkCookieValue("auth_token", strings.TrimSpace(form.AuthToken)); err != nil {
-			message(w, 400, err.Error())
-			return
-		}
-	}
-	if strings.TrimSpace(form.CT0) != "" {
-		if err := checkCookieValue("ct0", strings.TrimSpace(form.CT0)); err != nil {
-			message(w, 400, err.Error())
-			return
-		}
-	}
-	authToken, ct0, err := s.currentCookiePair()
+	added, err := checkout.UpsertXAccount(s.vault, form.Label, form.AuthToken, form.CT0)
 	if err != nil {
-		message(w, 500, "读取现有凭据失败。")
+		message(w, 400, err.Error())
 		return
 	}
-	if v := strings.TrimSpace(form.AuthToken); v != "" {
-		authToken = v
-	}
-	if v := strings.TrimSpace(form.CT0); v != "" {
-		ct0 = v
-	}
-	if authToken == "" || ct0 == "" {
-		message(w, 400, "auth_token 与 ct0 不能为空。")
-		return
-	}
-	cookies, err := json.Marshal(map[string]any{"cookies": []map[string]string{
-		{"name": "auth_token", "value": authToken, "domain": ".x.com"},
-		{"name": "ct0", "value": ct0, "domain": ".x.com"},
-	}})
-	if err != nil {
-		message(w, 500, "构造凭据失败。")
-		return
-	}
-	defer clear(cookies)
 
 	authorization := strings.TrimSpace(form.Authorization)
 	userAgent := strings.TrimSpace(form.UserAgent)
@@ -199,48 +162,27 @@ func (s *server) saveCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer clear(auth)
-
-	if err = s.vault.Put("cookies", cookies); err != nil {
-		message(w, 500, "保存 cookies 失败。")
-		return
-	}
 	if err = s.vault.Put("api-auth", auth); err != nil {
 		message(w, 500, "保存请求头失败。")
 		return
 	}
-	reply(w, 200, map[string]any{"ok": true})
+	reply(w, 200, map[string]any{"ok": true, "added": added})
 }
 
-// currentCookiePair reads the stored auth_token and ct0. A vault that has never
-// held a cookies record is an empty old value: the operator is configuring the
-// site for the first time and there is nothing to merge with. Any other read
-// failure is returned, because treating an unreadable record as empty would
-// overwrite whatever was actually configured.
-func (s *server) currentCookiePair() (string, string, error) {
-	raw, err := s.vault.Get("cookies")
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", nil
+// removeCredentials drops one sending account. Removing the last account
+// clears the pool and the mirrored legacy record.
+func (s *server) removeCredentials(w http.ResponseWriter, r *http.Request) {
+	var form struct {
+		ID string `json:"id"`
 	}
-	if err != nil {
-		return "", "", err
+	if !decode(w, r, &form) {
+		return
 	}
-	defer clear(raw)
-	var doc struct {
-		Cookies []struct{ Name, Value string } `json:"cookies"`
+	if err := checkout.RemoveXAccount(s.vault, strings.TrimSpace(form.ID)); err != nil {
+		message(w, 400, err.Error())
+		return
 	}
-	if json.Unmarshal(raw, &doc) != nil {
-		return "", "", errInvalidCredentials
-	}
-	var authToken, ct0 string
-	for _, c := range doc.Cookies {
-		switch c.Name {
-		case "auth_token":
-			authToken = c.Value
-		case "ct0":
-			ct0 = c.Value
-		}
-	}
-	return authToken, ct0, nil
+	reply(w, 200, map[string]any{"ok": true})
 }
 
 // readHeaders returns the stored Authorization header and User-Agent.
