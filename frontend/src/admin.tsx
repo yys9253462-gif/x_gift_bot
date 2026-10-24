@@ -579,7 +579,7 @@ function Admin() {
         id="generate-codes"
         icon={<ConfirmationNumberOutlined fontSize="small" />}
         title="生成兑换码"
-        hint="每批最多 500 枚。同名批次自动归入同一个文件夹。"
+        hint="每批最多 2000 枚。同名批次自动归入同一个文件夹。"
         sx={{ mb: 3 }}
       >
         <Box
@@ -593,7 +593,7 @@ function Admin() {
             const invalidCount =
               !Number.isInteger(Number(count)) ||
               Number(count) < 1 ||
-              Number(count) > 500;
+              Number(count) > 2000;
             setBatchError(invalidBatch);
             setCountError(invalidCount);
             if (
@@ -641,9 +641,9 @@ function Admin() {
               disabled={busy}
               error={countError}
               helperText={
-                countError ? "请输入 1–500 之间的整数" : "每批 1–500 枚"
+                countError ? "请输入 1–2000 之间的整数" : "每批 1–2000 枚"
               }
-              slotProps={{ htmlInput: { min: 1, max: 500, step: 1 } }}
+              slotProps={{ htmlInput: { min: 1, max: 2000, step: 1 } }}
             />
             <TextField
               label="批次名称（可选）"

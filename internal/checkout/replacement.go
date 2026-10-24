@@ -14,7 +14,7 @@ var ErrVerifyUnpaid = errors.New("inactive checkout requires operator verificati
 
 // CheckoutLink validates before exposing a persisted link to the admin UI.
 func CheckoutLink(r *Record) string {
-	if r != nil && sessionURL(r.URL, r.SessionID) {
+	if r != nil && !r.LinkBlocked && (r.Status == "created" || r.Status == "requires_action") && sessionURL(r.URL, r.SessionID) {
 		return r.URL
 	}
 	return ""
@@ -90,6 +90,10 @@ func PrepareRecoveryLinkForRecipient(ctx context.Context, v *vault.Vault, user, 
 	return prepareRecoveryLink(ctx, v, &r, s, plan, verifiedUnpaid, eligible, create)
 }
 func prepareRecoveryLink(ctx context.Context, v *vault.Vault, r *Record, s *stripeClient, plan Plan, verified bool, eligible func() error, create func() (string, string, error)) (*Record, error) {
+	r.LinkBlocked = true
+	if err := save(v, r); err != nil {
+		return r, err
+	}
 	var lookupErr error
 	if unsubmitted(r) {
 		page, err := s.page(ctx, r, true)
@@ -109,7 +113,14 @@ func prepareRecoveryLink(ctx context.Context, v *vault.Vault, r *Record, s *stri
 			if err = eligible(); err != nil {
 				return r, err
 			}
-			return r, nil
+			if err = rememberVerifiedCheckout(v, r, plan, page); err != nil {
+				return r, err
+			}
+			r.LinkBlocked = false
+			if err = save(v, r); err != nil {
+				return r, err
+			}
+			return r, holdPublicCheckout(v, r, plan, time.Now())
 		}
 	} else {
 		if err := verifySubmission(v, r, plan); err != nil {
@@ -168,9 +179,6 @@ func replacementEvidence(v *vault.Vault, r *Record) error {
 	if r.Status == "succeeded" || r.Status == "requires_action" {
 		return errors.New("original payment is not replaceable")
 	}
-	if r.ReplacementCount >= 3 {
-		return errors.New("replacement link limit reached")
-	}
 	if unsubmitted(r) && r.Status == "created" {
 		return nil
 	}
@@ -218,7 +226,11 @@ func replaceRecoveryLink(ctx context.Context, v *vault.Vault, r *Record, s *stri
 	if string(decoded) != string(old) {
 		return r, errors.New("original checkout changed")
 	}
-	next := Record{Username: r.Username, RecipientID: r.RecipientID, Months: r.Months, Amount: r.Amount, Currency: r.Currency, ProductID: r.ProductID, Status: "creating", Created: time.Now().Unix(), ReplacementCount: r.ReplacementCount + 1, PreviousSession: r.SessionID, CreationAttempts: 1}
+	gate := &xClient{vault: v, readCheckoutPaid: s.verifiedCheckoutPaid, readCheckout: func(ctx context.Context, active *Record) (*paymentPage, error) { return s.page(ctx, active, true) }}
+	if err := gate.checkCreation(ctx, time.Now()); err != nil {
+		return r, err
+	}
+	next := Record{Username: r.Username, RecipientID: r.RecipientID, Months: r.Months, Amount: r.Amount, Currency: r.Currency, ProductID: r.ProductID, Status: "creating", Created: time.Now().Unix(), ReplacementCount: r.ReplacementCount + 1, PreviousSession: r.SessionID}
 	fresh, err := json.Marshal(&next)
 	if err != nil {
 		return r, err
@@ -241,6 +253,7 @@ func replaceRecoveryLink(ctx context.Context, v *vault.Vault, r *Record, s *stri
 	if next.SessionID == r.SessionID || !sessionURL(next.URL, next.SessionID) {
 		return &next, errors.New("upstream did not create a distinct trusted checkout")
 	}
+	next.Created = time.Now().Unix()
 	next.Status = "created"
 	if err = save(v, &next); err != nil {
 		return &next, err
@@ -252,7 +265,10 @@ func replaceRecoveryLink(ctx context.Context, v *vault.Vault, r *Record, s *stri
 	if err = page.guard(&next, plan, true); err != nil {
 		return &next, err
 	}
-	return &next, nil
+	if err = rememberVerifiedCheckout(v, &next, plan, page); err != nil {
+		return &next, err
+	}
+	return &next, holdPublicCheckout(v, &next, plan, time.Now())
 }
 
 func RecoverWithNewLink(ctx context.Context, v *vault.Vault, user, recipient string, port, months int, verifiedUnpaid, linksOnly bool) (*Record, error) {

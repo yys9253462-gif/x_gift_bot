@@ -14,11 +14,11 @@ import (
 )
 
 type Record struct {
+	GenerationRequest string       `json:"generation_request,omitempty"`
+	LinkBlocked       bool         `json:"link_blocked,omitempty"`
 	ReplacementCount  int          `json:"replacement_count,omitempty"`
 	PreviousSession   string       `json:"previous_session,omitempty"`
 	ManualRecovery    bool         `json:"manual_recovery,omitempty"`
-	CreationRetryable bool         `json:"creation_retryable,omitempty"`
-	CreationAttempts  int          `json:"creation_attempts,omitempty"`
 	PreflightSaved    bool         `json:"preflight_saved,omitempty"`
 	PaymentMethod     string       `json:"payment_method,omitempty"`
 	CardFingerprint   string       `json:"card_fingerprint,omitempty"`
@@ -39,6 +39,19 @@ type Record struct {
 	Status      string `json:"status"`
 	Created     int64  `json:"created"`
 }
+
+var usernamePattern = regexp.MustCompile(`^[a-z0-9_]{1,15}$`)
+var ownerPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+// NormalizeUsername trims, lowercases and strips one leading @; ok reports a
+// valid X username.
+func NormalizeUsername(s string) (user string, ok bool) {
+	user = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(s), "@"))
+	return user, usernamePattern.MatchString(user)
+}
+
+// ValidOwner reports whether s is a public-link browser cookie value.
+func ValidOwner(s string) bool { return ownerPattern.MatchString(s) }
 
 var sessionPattern = regexp.MustCompile(`^cs_live_[A-Za-z0-9]+$`)
 var sessionPathPattern = regexp.MustCompile(`^/[A-Za-z]/pay/`)
@@ -76,8 +89,8 @@ func run(ctx context.Context, v *vault.Vault, user, expectedRecipient string, pa
 			return nil, ErrPaymentPaused
 		}
 	}
-	user = strings.ToLower(strings.TrimPrefix(user, "@"))
-	if !regexp.MustCompile(`^[a-z0-9_]{1,15}$`).MatchString(user) {
+	user, ok := NormalizeUsername(user)
+	if !ok {
 		return nil, errors.New("invalid username")
 	}
 	catalog, e := ReadCatalog(v)
@@ -102,11 +115,13 @@ func run(ctx context.Context, v *vault.Vault, user, expectedRecipient string, pa
 		return nil, errors.New("recipient identity changed; refusing to create or pay an order")
 	}
 	// Public manual checkouts must never be taken over by saved-card payment.
-	if raw, err := v.Get("public-checkout:" + recipient); err == nil {
-		clear(raw)
-		return nil, ErrPublicLinkConflict
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	// A live public session may still be paid outside our local lock, so never
+	// create/charge here while one could be payable; settled or expired records
+	// no longer block.
+	if live, err := publicSessionPayable(v, recipient, time.Now()); err != nil {
 		return nil, err
+	} else if live {
+		return nil, ErrPublicLinkConflict
 	}
 	// Fail closed on legacy records rather than silently bypassing an earlier attempt.
 	if _, e = v.Get("checkout:" + user); e == nil {
@@ -123,9 +138,6 @@ func run(ctx context.Context, v *vault.Vault, user, expectedRecipient string, pa
 		if r.Status == "creating" {
 			if r.SessionID != "" || r.URL != "" || r.PaymentMethod != "" || r.ConfirmParameters != "" || r.ConfirmKey != "" || r.SubmittedAt != 0 || r.PreflightSaved {
 				return nil, errors.New("creation record contains inconsistent payment evidence")
-			}
-			if !r.CreationRetryable || r.CreationAttempts < 1 || r.CreationAttempts >= maxAttempts {
-				return &r, errors.New("creation retry budget is unavailable or exhausted; automatic recovery blocked")
 			}
 		}
 		if r.Status != "creating" && !sessionURL(r.URL, r.SessionID) {
@@ -160,37 +172,23 @@ func run(ctx context.Context, v *vault.Vault, user, expectedRecipient string, pa
 		return nil, e
 	}
 	if r.SessionID == "" {
+		if e = x.checkCreation(ctx, time.Now()); e != nil {
+			return &r, e
+		}
 		if r.Status == "" {
 			r = Record{Username: user, RecipientID: recipient, Months: plan.Months, Amount: plan.Minor, Currency: strings.ToUpper(plan.Currency), ProductID: plan.ProductID, Status: "creating", Created: time.Now().Unix()}
 		}
-		for r.CreationAttempts < maxAttempts {
-			if e = ctx.Err(); e != nil {
-				return &r, e
-			}
-			// Reserve each creation attempt durably. A lost response can leave an
-			// unused external session, but only the selected saved session is paid.
-			r.CreationAttempts++
-			r.CreationRetryable = false
-			if e = save(v, &r); e != nil {
-				return &r, e
-			}
-			progress(ctx, 50, "正在创建专属赠送订单…")
-			r.SessionID, r.URL, e = x.create(ctx, user, recipient, plan)
-			if e == nil {
-				break
-			}
-			var retry *temporaryError
-			if errors.As(e, &retry) && r.CreationAttempts < maxAttempts {
-				r.CreationRetryable = true
-				if saveErr := save(v, &r); saveErr != nil {
-					return &r, saveErr
-				}
-			}
-			if stop := waitRetry(ctx, e, r.CreationAttempts); stop != nil {
-				return &r, stop
-			}
+		// Reserve the creation durably. Creating a checkout never charges; a lost
+		// response can leave an unused external session, but only the saved one is paid.
+		if e = save(v, &r); e != nil {
+			return &r, e
+		}
+		progress(ctx, 50, "正在创建专属赠送订单…")
+		if e = retrySafe(ctx, func() (err error) { r.SessionID, r.URL, err = x.create(ctx, user, recipient, plan); return }); e != nil {
+			return &r, e
 		}
 		r.Status = "created"
+		r.Created = time.Now().Unix()
 		if e = save(v, &r); e != nil {
 			return &r, e
 		}
@@ -217,6 +215,12 @@ func run(ctx context.Context, v *vault.Vault, user, expectedRecipient string, pa
 		return &r, save(v, &r)
 	}
 	if e = page.guard(&r, plan, true); e != nil {
+		return &r, e
+	}
+	if e = rememberVerifiedCheckout(v, &r, plan, page); e != nil {
+		return &r, e
+	}
+	if e = holdPublicCheckout(v, &r, plan, time.Now()); e != nil {
 		return &r, e
 	}
 	if !pay {

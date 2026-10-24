@@ -173,8 +173,8 @@ func (s *server) giftNow(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &q) {
 		return
 	}
-	q.Username = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(q.Username), "@"))
-	if !usernamePattern.MatchString(q.Username) {
+	var validUser bool
+	if q.Username, validUser = checkout.NormalizeUsername(q.Username); !validUser {
 		message(w, 400, "请填写正确的 X 用户名（不含 @，最多 15 个字母数字下划线）。")
 		return
 	}

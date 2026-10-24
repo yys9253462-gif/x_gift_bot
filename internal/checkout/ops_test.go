@@ -12,6 +12,10 @@ import (
 	"xgift/internal/vault"
 )
 
+type mockXTransport func(*http.Request) (*http.Response, error)
+
+func (f mockXTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func newOpsVault(t *testing.T) *vault.Vault {
 	t.Helper()
 	dir := t.TempDir()
@@ -187,6 +191,28 @@ func TestProbeUserIsNotARealAccount(t *testing.T) {
 	// A regression guard: the probe must never be pointed at a real recipient.
 	if ProbeUser == "" || !strings.HasPrefix(ProbeUser, "xgift_ops_probe") {
 		t.Fatalf("probe user changed and may address a real account: %q", ProbeUser)
+	}
+}
+
+func TestCreateProbeLeavesCreationReservationUntouched(t *testing.T) {
+	v := newOpsVault(t)
+	const reserved = "9999999999999"
+	if err := v.Put("checkout-creation:last", []byte(reserved)); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	c := &xClient{vault: v, headers: http.Header{}}
+	c.regionalHTTP = &http.Client{Transport: mockXTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return jsonResponse(`{"errors":[{"code":37,"message":"Current user is not eligible to gift"}]}`), nil
+	})}
+	_, _, err := c.createProbe(context.Background(), ProbeUser, "1234", Plan{})
+	if !errors.Is(err, ErrGiftNotAuthorised) || calls != 1 {
+		t.Fatalf("探测未取得账号拒绝结果: calls=%d error=%v", calls, err)
+	}
+	value, err := v.Get("checkout-creation:last")
+	if err != nil || string(value) != reserved || c.probe {
+		t.Fatalf("探测修改了正式创建状态: value=%s error=%v probe=%v", value, err, c.probe)
 	}
 }
 

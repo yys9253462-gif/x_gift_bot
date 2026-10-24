@@ -178,11 +178,16 @@ func Eligibility(ctx context.Context, v *vault.Vault, user string, port int) (st
 func (p Plan) Name() string { return fmt.Sprintf("Premium Gift - %d months", p.Months) }
 
 type xClient struct {
-	vault        *vault.Vault
-	http         *http.Client
-	regionalHTTP *http.Client
-	headers      http.Header
-	ops          ResolvedOps
+	publicReplacement string
+	publicRequestID   string
+	publicGeneration  bool
+	readCheckout      func(context.Context, *Record) (*paymentPage, error)
+	readCheckoutPaid  func(context.Context, *Record, Plan) (bool, error)
+	vault             *vault.Vault
+	http              *http.Client
+	regionalHTTP      *http.Client
+	headers           http.Header
+	ops               ResolvedOps
 	// closeRegional 释放为区域询价临时启动的付款出口（若启动过）。
 	closeRegional func()
 	// probe 为 true 时，本次创建只为向 X 询问判据：不写创建审计、
@@ -661,6 +666,14 @@ func (c *xClient) quote(ctx context.Context, user string, p Plan) error {
 	return nil
 }
 func (c *xClient) create(ctx context.Context, user, recipient string, p Plan) (string, string, error) {
+	if !c.probe {
+		if err := c.checkCreation(ctx, time.Now()); err != nil {
+			return "", "", err
+		}
+		if err := reserveCheckoutCreation(c.vault, time.Now()); err != nil {
+			return "", "", err
+		}
+	}
 	var r struct {
 		Data struct {
 			Gift struct {

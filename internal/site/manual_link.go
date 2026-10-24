@@ -2,15 +2,11 @@ package site
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
-	"os"
-	"regexp"
+	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"xgift/internal/checkout"
 )
@@ -33,39 +29,41 @@ func (s *server) manualLinkPlans(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]any{"plans": plans})
 }
 
-func (s *server) publicLinkPlans(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie("__Host-xgift-link"); err != nil || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(c.Value) {
-		var b [32]byte
-		if _, err = rand.Read(b[:]); err != nil {
-			message(w, 503, "请稍后重试。")
-			return
-		}
-		http.SetCookie(w, &http.Cookie{Name: "__Host-xgift-link", Value: hex.EncodeToString(b[:]), Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 30 * 24 * 60 * 60})
+// linkOwner returns this browser's public-link cookie, issuing one if needed.
+func linkOwner(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie("__Host-xgift-link"); err == nil && checkout.ValidOwner(c.Value) {
+		return c.Value
 	}
+	owner := token(32)
+	http.SetCookie(w, &http.Cookie{Name: "__Host-xgift-link", Value: owner, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 30 * 24 * 60 * 60})
+	return owner
+}
+
+func (s *server) publicLinkPlans(w http.ResponseWriter, r *http.Request) {
+	linkOwner(w, r)
 	s.manualLinkPlans(w, r)
 }
 func (s *server) publicLink(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("__Host-xgift-link")
-	if err != nil || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(c.Value) {
-		message(w, 400, "请刷新页面后重新生成链接。")
-		return
-	}
-	s.generateManualLink(w, r, c.Value)
+	s.generateManualLink(w, r, linkOwner(w, r))
 }
 func (s *server) manualLink(w http.ResponseWriter, r *http.Request) {
 	s.generateManualLink(w, r, "")
 }
+
+type manualLinkRequest struct {
+	Username       string `json:"username"`
+	Months         int    `json:"months"`
+	RequestID      string `json:"request_id,omitempty"`
+	VerifiedUnpaid bool   `json:"verified_unpaid"`
+}
+
 func (s *server) generateManualLink(w http.ResponseWriter, r *http.Request, publicOwner string) {
-	var q struct {
-		Username       string `json:"username"`
-		Months         int    `json:"months"`
-		VerifiedUnpaid bool   `json:"verified_unpaid"`
-	}
+	var q manualLinkRequest
 	if !decode(w, r, &q) {
 		return
 	}
-	q.Username = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(q.Username), "@"))
-	if !usernamePattern.MatchString(q.Username) || q.Months < 1 || q.Months > 24 {
+	var ok bool
+	if q.Username, ok = checkout.NormalizeUsername(q.Username); !ok || q.Months < 1 || q.Months > 24 {
 		message(w, 400, "请填写正确的 X 用户名并选择套餐时长。")
 		return
 	}
@@ -78,106 +76,123 @@ func (s *server) generateManualLink(w http.ResponseWriter, r *http.Request, publ
 		message(w, 400, "该套餐时长未配置。")
 		return
 	}
-	select {
-	case s.work <- struct{}{}:
-	default:
-		message(w, 409, "有订单正在处理，请稍后再生成链接。")
+	if publicOwner != "" {
+		if q.RequestID != "" && !checkout.ValidOwner(q.RequestID) {
+			message(w, 400, "无效的生成请求。")
+			return
+		}
+		s.enqueuePublicLink(w, q, publicOwner)
 		return
 	}
-	defer func() { <-s.work }()
-	lock, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		message(w, 503, "无法锁定订单，请稍后重试。")
-		return
+	s.createLink(r.Context(), q, "").write(w)
+}
+
+// linkOutcome is the result of one link attempt. retryIn > 0 marks a transient
+// wait (the queue keeps the ticket); blocked is the creation window for ETAs.
+type linkOutcome struct {
+	status   int
+	body     map[string]any
+	retryIn  time.Duration
+	blocked  time.Duration
+	declined bool
+}
+
+func failed(status int, msg string) linkOutcome {
+	return linkOutcome{status: status, body: map[string]any{"message": msg}}
+}
+
+func (o linkOutcome) write(w http.ResponseWriter) {
+	if o.retryIn > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int((o.retryIn+time.Second-1)/time.Second)))
 	}
-	defer lock.Close()
-	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
-		message(w, 409, "有订单正在处理，请稍后再生成链接。")
-		return
+	reply(w, o.status, o.body)
+}
+
+func (s *server) createLink(ctx context.Context, q manualLinkRequest, publicOwner string) linkOutcome {
+	release, ok := s.tryLock()
+	if !ok {
+		o := failed(409, "有订单正在处理，请稍后再生成链接。")
+		o.retryIn = 3 * time.Second
+		return o
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	ctx, cancel := context.WithTimeout(r.Context(), 110*time.Second)
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, 110*time.Second)
 	defer cancel()
 	var record *checkout.Record
+	var err error
 	if publicOwner != "" {
-		record, err = checkout.PublicLinkForUsername(ctx, s.vault, q.Username, publicOwner, s.port, q.Months)
+		record, err = checkout.PublicLinkForRequest(ctx, s.vault, q.Username, publicOwner, s.port, q.Months, q.RequestID)
 	} else {
 		record, err = checkout.ManualLinkForUsername(ctx, s.vault, q.Username, s.port, q.Months, q.VerifiedUnpaid)
 	}
-	if err != nil {
-		// Error classification only: never log links, ownership cookies, card data,
-		// upstream response bodies or authorization headers.
-		reason := manualLinkFailureReason(err)
-		log.Printf("manual link failed: public=%t username=%s months=%d reason=%s", publicOwner != "", q.Username, q.Months, reason)
-		switch {
-		case errors.Is(err, checkout.ErrPublicLinkPrivateOrder):
-			message(w, 409, "该账号已有兑换或后台订单，请使用原付款链接或联系管理员；主页不会重复创建订单。")
-		case errors.Is(err, checkout.ErrPublicLinkOtherBrowser):
-			message(w, 409, "该账号已有手动付款链接，请在最初生成链接的浏览器中使用相同套餐重试，或联系管理员。")
-		case errors.Is(err, checkout.ErrPublicLinkPlan):
-			message(w, 409, "该账号已有其他时长的付款链接，请选择原套餐取回链接，或联系管理员。")
-		case errors.Is(err, checkout.ErrPublicLinkRetryLimit):
-			message(w, 409, "创建链接已连续失败，请联系管理员检查；系统没有提交付款。")
-		case errors.Is(err, checkout.ErrPublicLinkPending):
-			message(w, 502, "暂未取得付款链接，系统没有提交付款。请在同一浏览器用相同账号和套餐重试；请勿同时使用其他入口重复建单。")
-		case errors.Is(err, checkout.ErrPublicLinkConflict):
-			message(w, 409, "该账号暂时无法生成新链接，请使用原付款页面或联系管理员核实。")
-		case errors.Is(err, checkout.ErrVerifyUnpaid):
-			reply(w, 409, map[string]any{"message": "原付款链接已失效，请核实原订单未付款后再重新生成。", "needs_unpaid_verification": true})
-		case errors.Is(err, checkout.ErrNotEligible):
-			message(w, 409, "该账号目前无法接收 Premium 赠送。")
-		case errors.Is(err, checkout.ErrUserNotFound):
-			message(w, 404, "未找到该 X 用户名。")
-		case errors.Is(err, checkout.ErrManualLinkConflict):
-			message(w, 409, "该客户已有其他套餐或账号信息的订单，请先通过客户查询核实原订单。")
-		default:
-			if record != nil && record.SubmittedAt != 0 {
-				message(w, 409, "原付款尚未确认可以重建，请先核实原付款结果。")
-			} else {
-				message(w, 502, "暂时无法生成付款链接，请稍后重试；重复请求会优先检查已有订单。")
-			}
+	if err == nil {
+		return s.linkResult(record, publicOwner)
+	}
+	// Error classification only: never log links, ownership cookies, card data,
+	// upstream response bodies or authorization headers.
+	var o linkOutcome
+	reason := ""
+	switch {
+	case errors.Is(err, checkout.ErrCheckoutRateLimited):
+		// Waiting for the active payment window is normal at the queue head.
+		// Recheck early for completed payments while keeping the real ETA.
+		o = failed(429, "正在等待处理，请稍候。")
+		o.blocked = 15 * time.Second
+		var wait *checkout.CheckoutWaitError
+		if errors.As(err, &wait) {
+			o.blocked = max(wait.Wait, time.Second)
 		}
-		return
+		o.retryIn = min(o.blocked, 10*time.Second)
+		return o
+	case errors.Is(err, checkout.ErrPublicPaymentDeclined):
+		reason, o = "payment_declined", failed(409, "上游拒绝了本次付款，通道已让给下一位。重试需要重新排队。")
+		o.declined = true
+	case errors.Is(err, checkout.ErrPublicPaymentInProgress):
+		reason, o = "payment_in_progress", failed(409, "原付款结果尚未核实，请查询付款状态或联系管理员；不会自动重建或再次扣款。")
+	case errors.Is(err, checkout.ErrPublicLinkPrivateOrder):
+		reason, o = "private_order", failed(409, "该账号有一笔兑换订单的付款仍在处理中，请核实结果后再生成链接。")
+	case errors.Is(err, checkout.ErrPublicLinkPending):
+		reason, o = "creation_pending", failed(409, "暂未取得付款链接，系统没有提交付款。请用相同账号和套餐重试；请勿同时使用其他入口重复建单。")
+	case errors.Is(err, checkout.ErrPublicLinkConflict):
+		reason, o = "public_order_conflict", failed(409, "该账号暂时无法生成新链接，请使用原付款页面或联系管理员核实。")
+	case errors.Is(err, checkout.ErrVerifyUnpaid) && publicOwner != "":
+		reason, o = "link_expired_unpaid", failed(409, "原付款链接已停止提供；请查询原订单状态或联系管理员核实，不会自动重建。")
+	case errors.Is(err, checkout.ErrVerifyUnpaid):
+		reason, o = "requires_unpaid_confirmation", linkOutcome{status: 409, body: map[string]any{"message": "原付款链接已失效，请核实原订单未付款后再重新生成。", "needs_unpaid_verification": true}}
+	case errors.Is(err, checkout.ErrNotEligible):
+		reason, o = "ineligible", failed(409, "X 目前不允许 @"+q.Username+" 接收 Premium 赠送，本次没有建单或扣款。可先用本页「检测赠送资格」确认，或改为其他账号。")
+	case errors.Is(err, checkout.ErrUserNotFound):
+		reason, o = "user_not_found", failed(404, "未找到 X 用户名 @"+q.Username+"。请填写个人主页 @ 后面的用户名（不是显示名称），核对拼写后重新提交；本次没有建单或扣款。")
+	case errors.Is(err, checkout.ErrManualLinkConflict):
+		reason, o = "manual_link_conflict", failed(409, "该客户已有其他套餐或账号信息的订单，请先通过客户查询核实原订单。")
+	case record != nil && record.SubmittedAt != 0:
+		reason, o = "submitted_order", failed(409, "原付款尚未确认可以重建，请先核实原付款结果。")
+	default:
+		reason, o = "upstream_or_order_verification", failed(502, "暂时无法生成付款链接，请稍后重试；重复请求会优先检查已有订单。")
+		if errors.Is(err, checkout.ErrXReadFailure) {
+			reason = "x_read_failure"
+		}
 	}
-	if record == nil {
-		message(w, 502, "未取得有效订单。")
-		return
-	}
+	log.Printf("manual link failed: public=%t months=%d reason=%s", publicOwner != "", q.Months, reason)
+	return o
+}
+
+func (s *server) linkResult(record *checkout.Record, publicOwner string) linkOutcome {
 	result := map[string]any{"username": record.Username, "months": record.Months, "amount": record.Amount, "currency": record.Currency, "status": record.Status}
 	if record.Status == "succeeded" {
 		result["message"] = "该客户的这笔订单已付款成功，无需再次付款。"
-	} else {
-		link := checkout.CheckoutLink(record)
-		if link == "" {
-			message(w, 502, "未取得有效付款链接。")
-			return
-		}
-		result["checkout_url"] = link
+		return linkOutcome{status: 200, body: result}
 	}
-	reply(w, 200, result)
-}
-
-func manualLinkFailureReason(err error) string {
-	switch {
-	case errors.Is(err, checkout.ErrPublicLinkPrivateOrder):
-		return "private_order"
-	case errors.Is(err, checkout.ErrPublicLinkOtherBrowser):
-		return "browser_mismatch"
-	case errors.Is(err, checkout.ErrPublicLinkPlan):
-		return "plan_mismatch"
-	case errors.Is(err, checkout.ErrPublicLinkRetryLimit):
-		return "creation_retry_limit"
-	case errors.Is(err, checkout.ErrPublicLinkPending):
-		return "creation_pending"
-	case errors.Is(err, checkout.ErrPublicLinkConflict):
-		return "public_order_conflict"
-	case errors.Is(err, checkout.ErrNotEligible):
-		return "ineligible"
-	case errors.Is(err, checkout.ErrUserNotFound):
-		return "user_not_found"
-	case errors.Is(err, checkout.ErrXReadFailure):
-		return "x_read_failure"
-	default:
-		return "upstream_or_order_verification"
+	link := checkout.CheckoutLink(record)
+	if link == "" {
+		return failed(502, "未取得有效付款链接。")
 	}
+	result["checkout_url"] = link
+	if publicOwner != "" {
+		result["message"] = "已生成新的付款链接。旧链接无法由本站作废；若原付款结果未知，请先核实，勿在多个链接重复付款。"
+		result["expires_at"] = record.Created + int64(checkout.PublicLinkTTL/time.Second)
+		s.invalidateOlderPublicResults(record.Username, link)
+		log.Printf("public link ready: months=%d stripe_verified=true", record.Months)
+	}
+	return linkOutcome{status: 200, body: result}
 }

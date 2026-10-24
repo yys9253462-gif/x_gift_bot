@@ -52,13 +52,13 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [confirmation, setConfirmation] = useState(false);
   const [pauseNotice, setPauseNotice] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
   const [severity, setSeverity] = useState<
     "info" | "success" | "warning" | "error"
   >("info");
   const [progress, setProgress] = useState<number | null>(null);
   const [locked, setLocked] = useState(false);
-  const [exhausted, setExhausted] = useState(false);
   const [validation, setValidation] = useState(false);
   // 本次会话的进度来自「兑换」还是「查询」,驱动进度区标题与区域命名。
   const fromRedeem = useRef(false);
@@ -185,22 +185,11 @@ function App() {
     try {
       const { ok, data } = await send("/api/status");
       apply(ok, data);
-      if (
-        ok &&
-        (data.status === "processing" || data.rechecking) &&
-        attempt.current++ < 150
-      ) {
-        timer.current = setTimeout(query, 2000);
+      // Read-only status polling continues until the order settles; it slows
+      // down after five minutes but never gives up or resubmits the redemption.
+      if (ok && (data.status === "processing" || data.rechecking)) {
+        timer.current = setTimeout(query, attempt.current++ < 150 ? 2000 : 15000);
       } else {
-        if (data.status === "processing" || data.rechecking) {
-          setResult({
-            ...data,
-            message:
-              "等待时间较长，不代表付款失败。请保留兑换码，稍后查询进度，勿重复兑换。",
-          });
-          setSeverity("warning");
-          setExhausted(true);
-        }
         finish();
       }
     } catch {
@@ -231,7 +220,6 @@ function App() {
     attempt.current = 0;
     inFlight.current = true;
     setBusy(true);
-    setExhausted(false);
     setSeverity("info");
     // 继续查询保留已显示的进度,避免进度条倒退(apply 维持单调不降)。
     if (!keepProgress) setProgress(5);
@@ -279,7 +267,6 @@ function App() {
     if (locked) setLocked(false);
     setResult(null);
     setProgress(null);
-    setExhausted(false);
   }
 
   return (
@@ -516,27 +503,6 @@ function App() {
               {result.message}
             </Alert>
           )}
-          {exhausted && result && !busy && (
-            <Button
-              variant="outlined"
-              fullWidth
-              startIcon={<HistoryRounded />}
-              sx={{ mt: 2 }}
-              onClick={() => {
-                // Resume status polling only; never re-submits the redemption.
-                fromRedeem.current = false;
-                if (valid() && start(true)) {
-                  setResult({
-                    status: result.status,
-                    message: "正在继续查询原订单，不会再次扣款…",
-                  });
-                  void query();
-                }
-              }}
-            >
-              继续查询
-            </Button>
-          )}
           {result?.status === "succeeded" && (
             <Button
               href="https://x.com/i/premium"
@@ -605,12 +571,12 @@ function App() {
             </AccordionDetails>
           </Accordion>
         ))}
-        <Accordion disableGutters slotProps={{ transition: { unmountOnExit: true } }} sx={{ bgcolor: "transparent", borderBottom: 1, borderColor: "divider", "&:before": { display: "none" } }}>
+        <Accordion expanded={manualOpen} onChange={(_, expanded) => setManualOpen(expanded)} disableGutters slotProps={{ transition: { unmountOnExit: false } }} sx={{ bgcolor: "transparent", borderBottom: 1, borderColor: "divider", "&:before": { display: "none" } }}>
           <AccordionSummary expandIcon={<ExpandMoreRounded />} id="faq-manual-link" aria-controls="faq-manual-link-content" sx={{ px: 0, minHeight: 64 }}>
             <Typography fontWeight={500}>没有兑换码，可以为某个用户生成 Stripe 付款链接吗？</Typography>
           </AccordionSummary>
           <AccordionDetails id="faq-manual-link-content" sx={{ px: 0, pb: 3 }}>
-            <ManualPaymentPanel publicMode />
+            <ManualPaymentPanel publicMode onShow={() => setManualOpen(true)} />
           </AccordionDetails>
         </Accordion>
       </Box>
